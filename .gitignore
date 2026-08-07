@@ -12,5 +12,9 @@ wheels/
 # Editor files
 .idea
 
+# Claude Code local state
+.claude/settings.local.json
+.claude/worktrees/
+
 # Sphinx build output
 docs/_build/
