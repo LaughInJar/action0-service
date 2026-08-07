@@ -203,7 +203,9 @@ def _type_hints(provider: Callable[..., Any]) -> dict[str, Any]:
     :param provider: the class (its ``__init__`` is used) or callable
     :returns: parameter name to resolved annotation, ``Annotated`` preserved
     """
-    target: Any = provider.__init__ if isinstance(provider, type) else provider
+    # mypy flags __init__ access as unsound in general; here any __init__ is
+    # exactly the one whose parameter hints we want
+    target: Any = provider.__init__ if isinstance(provider, type) else provider  # type: ignore[misc]
     try:
         return typing.get_type_hints(target, include_extras=True)
     except Exception:

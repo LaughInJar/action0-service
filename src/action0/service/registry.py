@@ -466,6 +466,8 @@ class Registry:
             hints = typing.get_type_hints(func, include_extras=True)
         except Exception:
             hints = {}
+        # not every callable is a function object carrying a __qualname__
+        label = getattr(func, "__qualname__", None) or repr(func)
 
         @functools.wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -481,7 +483,7 @@ class Registry:
                 _, value = self._resolve_for_annotation(
                     hints.get(parameter_name),
                     has_default=False,
-                    where=f"parameter {parameter_name!r} of {func.__qualname__}()",
+                    where=f"parameter {parameter_name!r} of {label}()",
                 )
                 bound.arguments[parameter_name] = value
             return func(*bound.args, **bound.kwargs)
