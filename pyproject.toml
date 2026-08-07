@@ -1,0 +1,149 @@
+[project]
+name = "action0-service"
+dynamic = ["version"]
+authors = [
+    { name="Simon Lachinger" },
+]
+description = "Lightweight service registry and dependency injection framework"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["dependency-injection", "ioc", "service-locator", "registry", "singleton", "yaml"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+# only needed for Registry.load_yaml(); the core has zero dependencies
+yaml = [
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/LaughInJar/action0-service"
+Documentation = "https://laughinjar.github.io/action0-service/"
+Source = "https://github.com/LaughInJar/action0-service"
+Issues = "https://github.com/LaughInJar/action0-service/issues"
+
+[dependency-groups]
+dev = [
+    "ipython>=8.39.0",
+    "mypy>=2.3.0",
+    "pyright>=1.1.411",
+    "pytest>=9.0.3",
+    "pyyaml>=6.0",
+    "ruff>=0.15.6",
+    "ty>=0.0.23",
+    "types-pyyaml>=6.0",
+]
+docs = [
+    "furo>=2025.12.19",
+    "myst-parser>=5.1.0",
+    "sphinx>=9.0.4",
+    "sphinx-autodoc-typehints>=3.6.1",
+    "sphinx-copybutton>=0.5.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/action0/service/__init__.py"
+pattern = "__version__: str = \"(?P<version>[^\"]+)\""
+
+# ship the whole "action0" namespace package so the import name is
+# "action0.service" (hatch strips everything but the last path component)
+[tool.hatch.build.targets.wheel]
+packages = ["src/action0"]
+
+[tool.ruff]
+line-length = 99
+indent-width = 4
+# lint against the oldest supported Python so newer-only syntax is flagged
+target-version = "py311"
+exclude = [
+    ".git",
+    "dist",
+]
+
+[tool.ruff.lint]
+# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
+# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
+# McCabe complexity (`C901`) by default.
+select = ["F", "I", "W", "E4", "E7", "E9"]
+ignore = []
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.isort]
+force-single-line = true
+combine-as-imports = false
+known-first-party = ["action0"]
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+# Enable auto-formatting of code examples in docstrings. Markdown,
+# reStructuredText code/literal blocks and doctests are all supported.
+#
+# This is currently disabled by default, but it is planned for this
+# to be opt-out in the future.
+docstring-code-format = true
+
+# Set the line length limit used when formatting code snippets in
+# docstrings.
+#
+# This only has an effect when the `docstring-code-format` setting is
+# enabled.
+docstring-code-line-length = 99
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "src"]
+# run the >>> examples in the docstrings as tests so they can never go stale
+addopts = "--doctest-modules"
+consider_namespace_packages = true
+
+[tool.mypy]
+# check against the oldest supported Python version
+python_version = "3.11"
+files = ["src", "tests"]
+strict = true
+# "action0" is a PEP 420 namespace package (no __init__.py in src/action0),
+# so mypy needs the package root spelled out
+mypy_path = "src"
+explicit_package_bases = true
+
+[tool.pyright]
+# check against the oldest supported Python version
+pythonVersion = "3.11"
