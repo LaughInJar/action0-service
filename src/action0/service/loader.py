@@ -51,6 +51,7 @@ import yaml
 from action0.service.definitions import AnonymousFactory
 from action0.service.definitions import Definition
 from action0.service.errors import DefinitionError
+from action0.service.errors import DuplicateServiceError
 from action0.service.markers import Ref
 from action0.service.scopes import Scope
 
@@ -231,6 +232,9 @@ def _register_one(
             eager=eager,
             replace=replace,
         )
+    except DuplicateServiceError:
+        # the message already names the colliding service
+        raise
     except DefinitionError as error:
         raise DefinitionError(f"{key}: {error}") from error
 

@@ -344,7 +344,8 @@ class Registry:
             raise ServiceError(
                 "Registry.load_yaml() requires PyYAML — install 'action0-service[yaml]'"
             ) from error
-        return loader.load(self, source, replace=replace)
+        registry: Registry = self
+        return loader.load(registry, source, replace=replace)
 
     # ---------------------------------------------------------------------- lookup
 
@@ -466,6 +467,8 @@ class Registry:
             hints = typing.get_type_hints(func, include_extras=True)
         except Exception:
             hints = {}
+        # not every callable is a function object carrying a __qualname__
+        label = getattr(func, "__qualname__", None) or repr(func)
 
         @functools.wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -481,7 +484,7 @@ class Registry:
                 _, value = self._resolve_for_annotation(
                     hints.get(parameter_name),
                     has_default=False,
-                    where=f"parameter {parameter_name!r} of {func.__qualname__}()",
+                    where=f"parameter {parameter_name!r} of {label}()",
                 )
                 bound.arguments[parameter_name] = value
             return func(*bound.args, **bound.kwargs)
@@ -756,13 +759,10 @@ class Registry:
         :raises AmbiguousServiceError: if a layer has several candidates and
             no clear winner
         """
-        override_candidates = [
-            definition
-            for definition in self._overrides
-            if issubclass(definition.provides, requested)
-        ]
-        if override_candidates:
-            return self._select(override_candidates, requested), self
+        # among active overrides the most recent match wins outright
+        for definition in reversed(self._overrides):
+            if issubclass(definition.provides, requested):
+                return definition, self
         local_candidates = [
             definition
             for definition in self._definitions

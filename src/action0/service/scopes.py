@@ -157,7 +157,12 @@ class ThreadScope(ScopePolicy):
 
 
 class ContextScope(ScopePolicy):
-    """One instance per :py:mod:`contextvars` context (task-local in asyncio)."""
+    """One instance per :py:mod:`contextvars` context (task-local in asyncio).
+
+    Standard :py:mod:`contextvars` semantics apply: a context copied (or an
+    asyncio task spawned) *after* an instance was built inherits that
+    instance; instances built inside a copy stay inside it.
+    """
 
     def __init__(self) -> None:
         """Set up the per-definition context variables."""
