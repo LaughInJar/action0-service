@@ -21,6 +21,7 @@ its own registrations:
 True
 """
 
+import asyncio
 import contextlib
 import functools
 import inspect
@@ -28,6 +29,7 @@ import logging
 import os
 import threading
 import typing
+from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Mapping
@@ -64,19 +66,57 @@ from action0.service.scopes import TransientScope
 
 log = logging.getLogger(__name__)
 
-# The per-thread stack of definitions currently being built, for cycle
-# detection. Module-level (not per registry) so a chain that hops between
-# parent and child registries is still recognized as one chain.
+# The stacks of definitions currently being built, for cycle detection.
+# Module-level (not per registry) so a chain that hops between parent and
+# child registries is still recognized as one chain. Keyed per thread (the
+# thread-local dict) *and* per asyncio task within a thread, because
+# concurrent tasks interleave on one thread and one build chain always stays
+# within one task — sharing a stack across tasks would report false cycles.
 _RESOLVING = threading.local()
 
 
+def _stack_key() -> int:
+    """Return the calling task's stack key (``0`` outside any event loop)."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return id(task) if task is not None else 0
+
+
 def _resolution_stack() -> list[Definition]:
-    """Return the calling thread's in-progress build stack."""
-    stack: list[Definition] | None = getattr(_RESOLVING, "stack", None)
-    if stack is None:
-        stack = []
-        _RESOLVING.stack = stack
-    return stack
+    """Return the calling thread's/task's in-progress build stack."""
+    stacks: dict[int, list[Definition]] | None = getattr(_RESOLVING, "stacks", None)
+    if stacks is None:
+        stacks = {}
+        _RESOLVING.stacks = stacks
+    return stacks.setdefault(_stack_key(), [])
+
+
+def _active_resolution_stack() -> "list[Definition] | None":
+    """Return the calling thread's/task's build stack, or ``None`` if idle.
+
+    Unlike :py:func:`_resolution_stack` this never creates the stack, so
+    read-only callers leave no empty entries behind.
+    """
+    stacks: dict[int, list[Definition]] | None = getattr(_RESOLVING, "stacks", None)
+    if stacks is None:
+        return None
+    return stacks.get(_stack_key())
+
+
+def _discard_empty_stack() -> None:
+    """Drop the calling task's stack once its build chain has unwound.
+
+    Task ids are only unique among *live* tasks, so finished chains must not
+    leave entries behind.
+    """
+    stacks: dict[int, list[Definition]] | None = getattr(_RESOLVING, "stacks", None)
+    if stacks is not None:
+        key = _stack_key()
+        stack = stacks.get(key)
+        if stack is not None and not stack:
+            del stacks[key]
 
 
 _T = TypeVar("_T")
@@ -97,6 +137,28 @@ def _describe(annotation: Any) -> str:
     return getattr(annotation, "__name__", None) or repr(annotation)
 
 
+def _sentinel_parameters(
+    signature: inspect.Signature, bound: inspect.BoundArguments
+) -> Iterator[str]:
+    """
+    Yield the parameter names an :py:meth:`Registry.inject` wrapper must fill.
+
+    Those are the parameters whose default is the ``injected`` sentinel and
+    that the caller did not supply — or explicitly supplied *as* the sentinel.
+
+    :param signature: the wrapped function's signature
+    :param bound: the (partially) bound call arguments
+    :returns: the names in declaration order
+    """
+    for parameter_name, parameter in signature.parameters.items():
+        if parameter_name in bound.arguments:
+            if bound.arguments[parameter_name] is not injected:
+                continue
+        elif parameter.default is not injected:
+            continue
+        yield parameter_name
+
+
 class Registry:
     """Container that registers service definitions and resolves instances.
 
@@ -111,7 +173,11 @@ class Registry:
 
     Registries are context managers; leaving the ``with`` block calls
     :py:meth:`close`, which disposes managed instances in reverse creation
-    order.
+    order. Async applications use the ``a``-prefixed twins instead —
+    :py:meth:`aget`, :py:meth:`abuild`, :py:meth:`awarmup`,
+    :py:meth:`aclose`, ``async with`` — which additionally support
+    ``async def`` factories; one registry is meant to be driven from a
+    single event loop.
     """
 
     def __init__(self, *, parent: "Registry | None" = None) -> None:
@@ -457,6 +523,10 @@ class Registry:
 
             send_report("weekly")  # mailer resolved from the registry
 
+        On an ``async def`` function the wrapper is itself a coroutine
+        function and resolves the sentinel parameters through the async
+        paths — async services can be injected into async functions.
+
         :param func: the function to wrap
         :returns: a wrapper with the same signature
         :raises InjectionError: at call time, if a sentinel parameter cannot
@@ -470,15 +540,28 @@ class Registry:
         # not every callable is a function object carrying a __qualname__
         label = getattr(func, "__qualname__", None) or repr(func)
 
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Any:
+                bound = signature.bind_partial(*args, **kwargs)
+                for parameter_name in _sentinel_parameters(signature, bound):
+                    # has_default=False: the sentinel is no usable fallback,
+                    # so resolution failure must raise
+                    _, value = await self._aresolve_for_annotation(
+                        hints.get(parameter_name),
+                        has_default=False,
+                        where=f"parameter {parameter_name!r} of {label}()",
+                    )
+                    bound.arguments[parameter_name] = value
+                return await cast("Awaitable[Any]", func(*bound.args, **bound.kwargs))
+
+            return cast(Callable[_P, _R], async_wrapper)
+
         @functools.wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             bound = signature.bind_partial(*args, **kwargs)
-            for parameter_name, parameter in signature.parameters.items():
-                if parameter_name in bound.arguments:
-                    if bound.arguments[parameter_name] is not injected:
-                        continue
-                elif parameter.default is not injected:
-                    continue
+            for parameter_name in _sentinel_parameters(signature, bound):
                 # has_default=False: the sentinel is no usable fallback, so
                 # resolution failure must raise
                 _, value = self._resolve_for_annotation(
@@ -578,7 +661,9 @@ class Registry:
         :py:meth:`register_instance`) get their ``close()`` method called if
         they have one, dependents before dependencies. Errors are logged,
         not raised. After closing, any use of the registry raises
-        :py:class:`~action0.service.errors.ServiceError`.
+        :py:class:`~action0.service.errors.ServiceError`. Instances that
+        only offer an async ``aclose()`` method cannot be disposed here —
+        they are skipped with a warning; use :py:meth:`aclose` for those.
         """
         if self._closed:
             return
@@ -593,6 +678,12 @@ class Registry:
                         closer()
                     except Exception:
                         log.exception("error closing service %s", definition.label())
+                elif callable(getattr(instance, "aclose", None)):
+                    log.warning(
+                        "service %s only has an async aclose() and was not disposed — "
+                        "close the registry with aclose() instead",
+                        definition.label(),
+                    )
 
     def __enter__(self) -> "Registry":
         """Return ``self``; the registry is usable as a context manager."""
@@ -601,6 +692,145 @@ class Registry:
     def __exit__(self, *exc_info: object) -> None:
         """Close the registry when the ``with`` block ends."""
         self.close()
+
+    # ------------------------------------------------------------------- async API
+
+    @overload
+    async def aget(self, key: type[_T], *, name: str | None = None) -> _T: ...
+
+    @overload
+    async def aget(self, key: str) -> Any: ...
+
+    async def aget(self, key: "type[_T] | str", *, name: str | None = None) -> Any:
+        """
+        Async :py:meth:`get`: also resolves ``async def`` factories.
+
+        Lookup rules are identical to :py:meth:`get`; the difference is the
+        build path: async providers are awaited, and the dependencies of an
+        async build may themselves be async. Sync definitions resolve fine
+        through here too (and share their caches with the sync methods), so
+        async code can use ``aget()`` throughout. An async registry is meant
+        to be driven from a single event loop.
+
+        :param key: the requested type, or a service name
+        :param name: with a type key: request the service with this name
+        :returns: the service instance, built and cached per its scope
+        :raises ServiceNotFoundError: if nothing matches
+        :raises AmbiguousServiceError: if several services match a type
+            request and none is clearly the default
+        """
+        self._check_open()
+        definition, owner = self._lookup(key, name)
+        return await self._aresolve(definition, owner)
+
+    @overload
+    async def afind(self, key: type[_T], *, name: str | None = None) -> _T | None: ...
+
+    @overload
+    async def afind(self, key: str) -> Any: ...
+
+    async def afind(self, key: "type[_T] | str", *, name: str | None = None) -> Any:
+        """
+        Async :py:meth:`find`: like :py:meth:`aget`, but ``None`` when absent.
+
+        :param key: the requested type, or a service name
+        :param name: with a type key: request the service with this name
+        :returns: the service instance, or ``None`` if nothing is registered
+        """
+        self._check_open()
+        try:
+            definition, owner = self._lookup(key, name)
+        except ServiceNotFoundError:
+            return None
+        return await self._aresolve(definition, owner)
+
+    async def aget_all(self, key: type[_T]) -> list[_T]:
+        """
+        Async :py:meth:`get_all`: instances of *all* services providing ``key``.
+
+        :param key: the requested type
+        :returns: one instance per matching definition (may be empty)
+        """
+        self._check_open()
+        return [
+            cast(_T, await self._aresolve(definition, owner))
+            for definition, owner in self._collect_by_type(key)
+        ]
+
+    async def abuild(self, provider: "type[_T] | Callable[..., _T]", /, **params: Any) -> _T:
+        """
+        Async :py:meth:`build`: one-off construction with async injection.
+
+        ``provider`` may be an ``async def`` factory (its result is awaited)
+        or any sync provider whose dependencies include async services.
+
+        :param provider: the class or factory to call
+        :param params: explicit parameter values
+        :returns: the new instance (never cached)
+        """
+        self._check_open()
+        provides = provider if isinstance(provider, type) else (infer_provides(provider) or object)
+        definition = Definition(
+            provider=provider,
+            provides=provides,
+            name=None,
+            scope=Scope.TRANSIENT.value,
+            params=params,
+            managed=False,
+        )
+        return cast(_T, await self._abuild_definition(definition))
+
+    async def awarmup(self) -> list[Any]:
+        """
+        Async :py:meth:`warmup`: eagerly build definitions, async ones included.
+
+        :returns: the instances that were created (or already cached)
+        """
+        self._check_open()
+        return [
+            await self._aresolve(definition, self)
+            for definition in list(self._definitions)
+            if definition.eager
+        ]
+
+    async def aclose(self) -> None:
+        """
+        Async :py:meth:`close`: also awaits ``aclose()`` disposal methods.
+
+        Teardown follows the same rules as :py:meth:`close`, except that a
+        managed instance with an ``aclose()`` method gets that awaited in
+        preference to a sync ``close()``. Errors are logged, not raised.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        for policy in self._scopes.values():
+            for definition, instance in policy.drain():
+                if not definition.managed:
+                    continue
+                acloser = getattr(instance, "aclose", None)
+                if callable(acloser):
+                    try:
+                        # cast: callable() narrows to "returns object", but an
+                        # aclose() disposer returns an awaitable by contract
+                        await cast("Awaitable[Any]", acloser())
+                    except Exception:
+                        log.exception("error closing service %s", definition.label())
+                    continue
+                closer = getattr(instance, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:
+                        log.exception("error closing service %s", definition.label())
+
+    async def __aenter__(self) -> "Registry":
+        """Return ``self``; the registry is usable as an async context manager."""
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Call :py:meth:`aclose` when the ``async with`` block ends."""
+        await self.aclose()
 
     # -------------------------------------------------------------------- protocol
 
@@ -868,7 +1098,14 @@ class Registry:
         :returns: the new instance
         :raises CircularDependencyError: if the definition is already being
             built further up the call stack
+        :raises ServiceError: if the provider is an ``async def`` factory —
+            async services (also as dependencies) need :py:meth:`aget`
         """
+        if definition.is_async:
+            raise ServiceError(
+                f"{definition.label()} has an async provider and cannot be resolved "
+                "synchronously — use aget()/abuild() from an event loop"
+            )
         stack = _resolution_stack()
         if definition in stack:
             chain = [*stack[stack.index(definition) :], definition]
@@ -879,6 +1116,7 @@ class Registry:
             return definition.provider(*args, **kwargs)
         finally:
             stack.pop()
+            _discard_empty_stack()
 
     def _resolve_arguments(self, definition: Definition) -> tuple[list[Any], dict[str, Any]]:
         """
@@ -1020,6 +1258,204 @@ class Registry:
                     f"Ref({ref.key.__name__}): no service registered for that type"
                 )
         return self._resolve(*found)
+
+    # ------------------------------------------------------------- async internals
+    # Deliberately parallel to the sync internals above: the sync paths stay
+    # coroutine-free (usable without a loop), the async paths await at every
+    # step so async providers can appear anywhere in a dependency chain.
+
+    async def _aresolve(self, definition: Definition, owner: "Registry") -> Any:
+        """
+        Async :py:meth:`_resolve`: honor the scope through its ``aget``.
+
+        Owner/builder semantics are identical to the sync path. One extra
+        duty: cycles must be detected *here*, before entering the scope
+        policy — the caching policies dedupe concurrent builds with
+        non-re-entrant :py:class:`asyncio.Lock` objects, so a cyclic chain
+        that re-enters ``aget`` for a definition this task is already
+        building would deadlock on its own lock instead of raising.
+
+        :param definition: the definition to resolve
+        :param owner: the registry the definition is stored in
+        :returns: the (new or cached) instance
+        :raises ScopeError: if the definition's scope is not registered
+        :raises CircularDependencyError: if this task is already building
+            ``definition`` further up its chain
+        """
+        stack = _active_resolution_stack()
+        if stack and definition in stack:
+            chain = [*stack[stack.index(definition) :], definition]
+            raise CircularDependencyError(" -> ".join(link.label() for link in chain))
+        policy = owner._scopes.get(definition.scope)
+        if policy is None:
+            raise ScopeError(
+                f"{definition.label()}: unknown scope {definition.scope!r} "
+                f"(registered: {sorted(owner._scopes)})"
+            )
+        builder = owner if policy.caches else self
+        return await policy.aget(definition, lambda: builder._abuild_definition(definition))
+
+    async def _abuild_definition(self, definition: Definition) -> Any:
+        """
+        Async :py:meth:`_build_definition`: construct one instance.
+
+        Cycle detection uses the same per-task stack as the sync path — a
+        build chain never leaves its task, and nested sync resolution inside
+        an async chain lands on the same stack.
+
+        :param definition: the definition to build
+        :returns: the new instance
+        :raises CircularDependencyError: if the definition is already being
+            built further up this task's chain
+        """
+        stack = _resolution_stack()
+        if definition in stack:
+            chain = [*stack[stack.index(definition) :], definition]
+            raise CircularDependencyError(" -> ".join(link.label() for link in chain))
+        stack.append(definition)
+        try:
+            args, kwargs = await self._aresolve_arguments(definition)
+            result = definition.provider(*args, **kwargs)
+            if definition.is_async:
+                return await cast("Awaitable[Any]", result)
+            return result
+        finally:
+            stack.pop()
+            _discard_empty_stack()
+
+    async def _aresolve_arguments(
+        self, definition: Definition
+    ) -> tuple[list[Any], dict[str, Any]]:
+        """
+        Async :py:meth:`_resolve_arguments`: same rules, awaited resolution.
+
+        :param definition: the definition being built
+        :returns: positional arguments and keyword arguments
+        :raises DefinitionError: for unknown param keys or unfillable
+            positional-only parameters
+        :raises InjectionError: for unresolvable required parameters
+        """
+        if not definition.introspect:
+            return [], {}
+        spec = provider_spec(definition.provider)
+        params = definition.params
+        if not spec.introspectable:
+            # no signature available: pass configured params verbatim
+            return [], {key: await self._aresolve_value(value) for key, value in params.items()}
+        args: list[Any] = []
+        kwargs: dict[str, Any] = {}
+        skipped_positional = False
+        for parameter in spec.parameters:
+            if parameter.name in params:
+                filled, value = True, await self._aresolve_value(params[parameter.name])
+            else:
+                filled, value = await self._aresolve_for_annotation(
+                    parameter.annotation,
+                    has_default=parameter.has_default,
+                    where=f"parameter {parameter.name!r} of {definition.label()}",
+                )
+            if not filled:
+                if parameter.positional_only:
+                    skipped_positional = True
+                continue
+            if parameter.positional_only:
+                if skipped_positional:
+                    raise DefinitionError(
+                        f"{definition.label()}: cannot fill positional-only parameter "
+                        f"{parameter.name!r} because an earlier positional-only "
+                        "parameter was left at its default"
+                    )
+                args.append(value)
+            else:
+                kwargs[parameter.name] = value
+        known = {parameter.name for parameter in spec.parameters}
+        unknown = [key for key in params if key not in known]
+        if unknown:
+            if not spec.has_var_keyword:
+                raise DefinitionError(
+                    f"{definition.label()}: unknown init parameter(s): "
+                    + ", ".join(sorted(unknown))
+                )
+            for key in unknown:
+                kwargs[key] = await self._aresolve_value(params[key])
+        return args, kwargs
+
+    async def _aresolve_for_annotation(
+        self, annotation: Any, *, has_default: bool, where: str
+    ) -> tuple[bool, Any]:
+        """
+        Async :py:meth:`_resolve_for_annotation`: same resolution order.
+
+        :param annotation: the parameter's annotation (may be ``None``)
+        :param has_default: whether the parameter has a provider default to
+            fall back to
+        :param where: description of the parameter for error messages
+        :returns: ``(filled, value)`` — ``filled`` is ``False`` when the
+            provider default should be used instead
+        :raises InjectionError: if the parameter is required but unresolvable
+        :raises AmbiguousServiceError: if several services match the type
+        """
+        core, optional, named = unwrap_annotation(annotation)
+        if named is not None:
+            found = self._find_by_name(named)
+            if found is not None:
+                return True, await self._aresolve(*found)
+            if optional:
+                return True, None
+            if has_default:
+                return False, None
+            raise InjectionError(f"cannot resolve {where}: no service named {named!r}")
+        if isinstance(core, type) and core not in NON_INJECTABLE_TYPES:
+            found = self._find_by_type(core)
+            if found is not None:
+                return True, await self._aresolve(*found)
+        if has_default:
+            return False, None
+        if optional:
+            return True, None
+        raise InjectionError(
+            f"cannot resolve {where}: no configured value, no default, and no "
+            f"registered service for {_describe(annotation)}"
+        )
+
+    async def _aresolve_value(self, value: Any) -> Any:
+        """
+        Async :py:meth:`_resolve_value`: resolve markers, awaiting builds.
+
+        :param value: the configured value to resolve recursively
+        :returns: the resolved value
+        """
+        if isinstance(value, Ref):
+            return await self._aresolve_ref(value)
+        if isinstance(value, AnonymousFactory):
+            return await self._abuild_definition(value.definition)
+        if isinstance(value, list):
+            return [await self._aresolve_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple([await self._aresolve_value(item) for item in value])
+        if isinstance(value, dict):
+            return {key: await self._aresolve_value(item) for key, item in value.items()}
+        return value
+
+    async def _aresolve_ref(self, ref: Ref) -> Any:
+        """
+        Async :py:meth:`_resolve_ref`: resolve a reference marker.
+
+        :param ref: the reference (service name or type)
+        :returns: the referenced service instance
+        :raises ServiceNotFoundError: if the target is not registered
+        """
+        if isinstance(ref.key, str):
+            found = self._find_by_name(ref.key)
+            if found is None:
+                raise ServiceNotFoundError(f"Ref({ref.key!r}): no service with that name")
+        else:
+            found = self._find_by_type(ref.key)
+            if found is None:
+                raise ServiceNotFoundError(
+                    f"Ref({ref.key.__name__}): no service registered for that type"
+                )
+        return await self._aresolve(*found)
 
     # ------------------------------------------------------------------ validation
 

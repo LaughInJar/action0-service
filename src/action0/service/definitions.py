@@ -83,6 +83,18 @@ class Definition:
     introspect: bool = True
     """Whether the provider's signature is inspected for injection."""
 
+    is_async: bool = field(init=False, default=False)
+    """Whether the provider is a coroutine function (``async def`` factory).
+
+    Async definitions can only be resolved through the ``a``-prefixed
+    registry methods (:py:meth:`~action0.service.registry.Registry.aget`
+    and friends); the sync paths refuse them with a clear error.
+    """
+
+    def __post_init__(self) -> None:
+        """Detect async providers once, at construction time."""
+        self.is_async = inspect.iscoroutinefunction(self.provider)
+
     def label(self) -> str:
         """
         Return a short human-readable identifier for error messages.
