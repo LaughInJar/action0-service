@@ -29,6 +29,7 @@ import os
 import threading
 import typing
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from typing import IO
@@ -97,6 +98,40 @@ def _describe(annotation: Any) -> str:
     return getattr(annotation, "__name__", None) or repr(annotation)
 
 
+def _profile_set(profiles: "Iterable[str] | None") -> frozenset[str]:
+    """
+    Normalize a ``profiles`` argument to a frozenset.
+
+    A bare string is treated as a single profile name, not as an iterable
+    of its characters.
+
+    :param profiles: the profiles as given (may be ``None``)
+    :returns: the normalized set (empty for ``None``)
+    """
+    if profiles is None:
+        return frozenset()
+    if isinstance(profiles, str):
+        return frozenset((profiles,))
+    return frozenset(profiles)
+
+
+def _profiles_overlap(first: Definition, second: Definition) -> bool:
+    """
+    Return whether two definitions could ever be active simultaneously.
+
+    Definitions with disjoint non-empty profile sets can coexist under one
+    name (only one of them is ever visible); a universal definition (no
+    profiles) overlaps with everything.
+
+    :param first: one definition
+    :param second: the other definition
+    :returns: ``True`` if some registry could see both at once
+    """
+    if not first.profiles or not second.profiles:
+        return True
+    return bool(first.profiles & second.profiles)
+
+
 class Registry:
     """Container that registers service definitions and resolves instances.
 
@@ -109,21 +144,42 @@ class Registry:
     A registry can have a ``parent``: lookups fall back to the parent, local
     registrations shadow it — useful for request-scoped wiring and tests.
 
+    Registrations may be limited to *profiles* (e.g. ``dev`` / ``prod``);
+    definitions whose profiles do not intersect the registry's active
+    profiles are invisible to every lookup. See :py:attr:`profiles`.
+
     Registries are context managers; leaving the ``with`` block calls
     :py:meth:`close`, which disposes managed instances in reverse creation
     order.
     """
 
-    def __init__(self, *, parent: "Registry | None" = None) -> None:
+    def __init__(
+        self,
+        *,
+        parent: "Registry | None" = None,
+        profiles: "Iterable[str] | None" = None,
+    ) -> None:
         """
         Create an empty registry.
 
         :param parent: optional registry to fall back to when a lookup finds
             nothing locally
+        :param profiles: the active profiles of this registry; a bare string
+            counts as one profile. ``None`` inherits the parent's profiles
+            (no profiles without a parent). Profiles are fixed at
+            construction — flipping them on a live registry would leave
+            cached instances built for the old profile set behind, so to
+            change profiles, create a new registry (or a child).
         """
         self._parent = parent
+        if profiles is not None:
+            self._profiles = _profile_set(profiles)
+        elif parent is not None:
+            self._profiles = parent.profiles
+        else:
+            self._profiles = frozenset()
         self._definitions: list[Definition] = []
-        self._by_name: dict[str, Definition] = {}
+        self._by_name: dict[str, list[Definition]] = {}
         self._overrides: list[Definition] = []
         self._scopes: dict[str, ScopePolicy] = {
             Scope.SINGLETON.value: SingletonScope(),
@@ -132,6 +188,11 @@ class Registry:
             Scope.CONTEXT.value: ContextScope(),
         }
         self._closed = False
+
+    @property
+    def profiles(self) -> frozenset[str]:
+        """The active profiles this registry was created with (immutable)."""
+        return self._profiles
 
     # ---------------------------------------------------------------- registration
 
@@ -145,6 +206,7 @@ class Registry:
         provides: type[Any] | None = None,
         default: bool | None = None,
         eager: bool = False,
+        profiles: "Iterable[str] | None" = None,
         replace: bool = False,
     ) -> Definition:
         """
@@ -165,6 +227,9 @@ class Registry:
         :param default: whether this definition wins ambiguous type lookups;
             defaults to ``True`` for unnamed and ``False`` for named services
         :param eager: instantiate this service in :py:meth:`warmup`
+        :param profiles: limit this definition to the given profiles (a bare
+            string counts as one profile); it is only visible in registries
+            whose :py:attr:`profiles` intersect. Default: active everywhere
         :param replace: overwrite a colliding registration instead of
             raising :py:class:`~action0.service.errors.DuplicateServiceError`
         :returns: the stored :py:class:`~action0.service.definitions.Definition`
@@ -195,6 +260,7 @@ class Registry:
             params=dict(params) if params else {},
             default=default if default is not None else name is None,
             eager=eager,
+            profiles=_profile_set(profiles),
         )
         self._add(definition, replace=replace)
         return definition
@@ -206,6 +272,7 @@ class Registry:
         name: str | None = None,
         provides: type[Any] | None = None,
         default: bool | None = None,
+        profiles: "Iterable[str] | None" = None,
         replace: bool = False,
     ) -> Definition:
         """
@@ -220,6 +287,8 @@ class Registry:
             ``type(instance)``
         :param default: whether this definition wins ambiguous type lookups;
             defaults to ``True`` for unnamed and ``False`` for named services
+        :param profiles: limit this definition to the given profiles; see
+            :py:meth:`register`
         :param replace: overwrite a colliding registration instead of raising
         :returns: the stored :py:class:`~action0.service.definitions.Definition`
         :raises DefinitionError: if ``instance`` is not an instance of
@@ -237,6 +306,7 @@ class Registry:
             name=name,
             scope=Scope.SINGLETON.value,
             default=default if default is not None else name is None,
+            profiles=_profile_set(profiles),
             managed=False,
             introspect=False,
         )
@@ -257,6 +327,7 @@ class Registry:
         provides: type[Any] | None = None,
         default: bool | None = None,
         eager: bool = False,
+        profiles: "Iterable[str] | None" = None,
         replace: bool = False,
     ) -> Callable[[_C], _C]: ...
 
@@ -270,6 +341,7 @@ class Registry:
         provides: type[Any] | None = None,
         default: bool | None = None,
         eager: bool = False,
+        profiles: "Iterable[str] | None" = None,
         replace: bool = False,
     ) -> Any:
         """
@@ -286,6 +358,7 @@ class Registry:
         :param provides: see :py:meth:`register`
         :param default: see :py:meth:`register`
         :param eager: see :py:meth:`register`
+        :param profiles: see :py:meth:`register`
         :param replace: see :py:meth:`register`
         :returns: the decorated object, or the decorator to apply
         """
@@ -303,6 +376,7 @@ class Registry:
                 provides=provides,
                 default=default,
                 eager=eager,
+                profiles=profiles,
                 replace=replace,
             )
             return target
@@ -539,7 +613,8 @@ class Registry:
         Instantiate every definition registered with ``eager=True``.
 
         Call this at application boot to fail fast and to pay construction
-        costs up front.
+        costs up front. Definitions inactive under the registry's profiles
+        are skipped.
 
         :returns: the instances that were created (or already cached)
         """
@@ -547,7 +622,7 @@ class Registry:
         return [
             self._resolve(definition, self)
             for definition in list(self._definitions)
-            if definition.eager
+            if definition.eager and self._is_active(definition)
         ]
 
     def validate(self) -> None:
@@ -557,13 +632,16 @@ class Registry:
         Detects: unknown ``params`` keys, required parameters that neither
         params, defaults, nor any registration can satisfy, dangling
         :py:class:`~action0.service.markers.Ref` targets, ambiguous
-        injections, and dependency cycles.
+        injections, and dependency cycles. Definitions inactive under the
+        registry's profiles are skipped — they could never be built here.
 
         :raises ValidationError: listing *all* problems found
         """
         self._check_open()
         problems: list[str] = []
         for definition in self._definitions:
+            if not self._is_active(definition):
+                continue
             problems.extend(self._validate_definition(definition))
         problems.extend(self._validate_cycles())
         if problems:
@@ -614,9 +692,9 @@ class Registry:
 
     def __contains__(self, key: "type[Any] | str") -> bool:
         """Return whether a lookup for ``key`` would find at least one service."""
-        if isinstance(key, str):
-            return self._find_by_name(key) is not None
         try:
+            if isinstance(key, str):
+                return self._find_by_name(key) is not None
             return self._find_by_type(key) is not None
         except AmbiguousServiceError:
             return True
@@ -654,47 +732,72 @@ class Registry:
             raise ScopeError(f"unknown scope {key!r} (registered: {sorted(self._scopes)})")
         return key
 
+    def _is_active(self, definition: Definition) -> bool:
+        """
+        Return whether a definition is visible under this registry's profiles.
+
+        Activity is evaluated against the registry layer that *owns* the
+        definition.
+
+        :param definition: a definition owned by this registry
+        :returns: ``True`` for universal definitions (no profiles) and for
+            definitions sharing at least one profile with the registry
+        """
+        return not definition.profiles or bool(definition.profiles & self._profiles)
+
     def _add(self, definition: Definition, *, replace: bool) -> None:
         """
         Store a definition, enforcing name and default-per-type uniqueness.
+
+        Two definitions may share a name (or an unnamed type) when their
+        profile sets are both non-empty and disjoint — they can never be
+        active at the same time. Anything that could be visible together
+        collides.
 
         :param definition: the definition to store
         :param replace: overwrite collisions instead of raising
         :raises DuplicateServiceError: on collisions without ``replace``
         """
         if definition.name is not None:
-            existing = self._by_name.get(definition.name)
-            if existing is not None:
-                if not replace:
-                    raise DuplicateServiceError(
-                        f"a service named {definition.name!r} is already registered "
-                        f"({existing.label()}); pass replace=True to overwrite"
-                    )
-                self._remove(existing)
-            self._by_name[definition.name] = definition
+            colliding = [
+                candidate
+                for candidate in self._by_name.get(definition.name, [])
+                if _profiles_overlap(candidate, definition)
+            ]
         else:
-            existing = next(
-                (
-                    candidate
-                    for candidate in self._definitions
-                    if candidate.name is None and candidate.provides is definition.provides
-                ),
-                None,
+            colliding = [
+                candidate
+                for candidate in self._definitions
+                if candidate.name is None
+                and candidate.provides is definition.provides
+                and _profiles_overlap(candidate, definition)
+            ]
+        if colliding and not replace:
+            if definition.name is not None:
+                raise DuplicateServiceError(
+                    f"a service named {definition.name!r} is already registered "
+                    f"({colliding[0].label()}); pass replace=True to overwrite, or "
+                    "give the definitions disjoint profiles"
+                )
+            raise DuplicateServiceError(
+                f"an unnamed service providing {colliding[0].label()} is already "
+                "registered; pass replace=True to overwrite, or register by name"
             )
-            if existing is not None:
-                if not replace:
-                    raise DuplicateServiceError(
-                        f"an unnamed service providing {existing.label()} is already "
-                        "registered; pass replace=True to overwrite, or register by name"
-                    )
-                self._remove(existing)
+        for existing in colliding:
+            self._remove(existing)
+        if definition.name is not None:
+            self._by_name.setdefault(definition.name, []).append(definition)
         self._definitions.append(definition)
 
     def _remove(self, definition: Definition) -> None:
         """Remove a stored definition from all indexes."""
         self._definitions.remove(definition)
         if definition.name is not None:
-            self._by_name.pop(definition.name, None)
+            named = self._by_name.get(definition.name)
+            if named is not None and definition in named:
+                named.remove(definition)
+                if not named:
+                    del self._by_name[definition.name]
 
     def _lookup(self, key: "type[Any] | str", name: str | None) -> "tuple[Definition, Registry]":
         """
@@ -734,15 +837,32 @@ class Registry:
         """
         Find a definition by name: overrides first, then own, then parent.
 
+        Definitions that are inactive under this registry's profiles are
+        invisible; the lookup falls through to the parent instead.
+
         :param name: the service name
         :returns: the definition and its owning registry, or ``None``
+        :raises AmbiguousServiceError: if several definitions under this
+            name are active at once (overlapping profiles were forced in
+            via ``replace=True`` layering or ambiguous profile sets)
         """
         for definition in reversed(self._overrides):
             if definition.name == name:
                 return definition, self
-        definition_or_none = self._by_name.get(name)
-        if definition_or_none is not None:
-            return definition_or_none, self
+        active = [
+            definition for definition in self._by_name.get(name, ()) if self._is_active(definition)
+        ]
+        if len(active) > 1:
+            raise AmbiguousServiceError(
+                f"{len(active)} definitions named {name!r} are active under "
+                f"profiles {sorted(self._profiles)}: "
+                + ", ".join(
+                    f"{definition.label()} with profiles {sorted(definition.profiles)}"
+                    for definition in active
+                )
+            )
+        if active:
+            return active[0], self
         if self._parent is not None:
             return self._parent._find_by_name(name)
         return None
@@ -766,7 +886,7 @@ class Registry:
         local_candidates = [
             definition
             for definition in self._definitions
-            if issubclass(definition.provides, requested)
+            if issubclass(definition.provides, requested) and self._is_active(definition)
         ]
         if local_candidates:
             return self._select(local_candidates, requested), self
@@ -817,7 +937,7 @@ class Registry:
         collected += [
             (definition, self)
             for definition in self._definitions
-            if issubclass(definition.provides, requested)
+            if issubclass(definition.provides, requested) and self._is_active(definition)
         ]
         if self._overrides:
             overridden_names = {
@@ -1196,5 +1316,6 @@ class Registry:
             done.add(definition)
 
         for definition in self._definitions:
-            visit(definition)
+            if self._is_active(definition):
+                visit(definition)
         return problems
