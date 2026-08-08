@@ -1,3 +1,6 @@
+from action0.service.default import default_registry
+from action0.service.default import set_default_registry
+from action0.service.default import using_default_registry
 from action0.service.definitions import Definition
 from action0.service.errors import AmbiguousServiceError
 from action0.service.errors import CircularDependencyError
@@ -41,5 +44,8 @@ __all__ = [
     "ThreadScope",
     "TransientScope",
     "ValidationError",
+    "default_registry",
     "injected",
+    "set_default_registry",
+    "using_default_registry",
 ]
