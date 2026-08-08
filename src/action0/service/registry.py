@@ -23,6 +23,7 @@ True
 
 import contextlib
 import functools
+import importlib.metadata
 import inspect
 import logging
 import os
@@ -95,6 +96,50 @@ def _describe(annotation: Any) -> str:
     if annotation is None:
         return "<no type annotation>"
     return getattr(annotation, "__name__", None) or repr(annotation)
+
+
+def _distribution_name(entry_point: importlib.metadata.EntryPoint) -> str:
+    """
+    Return the name of the distribution advertising an entry point.
+
+    :param entry_point: the entry point to describe
+    :returns: the distribution name, or a placeholder if unavailable
+    """
+    distribution = getattr(entry_point, "dist", None)
+    if distribution is None:
+        return "unknown distribution"
+    try:
+        return str(distribution.name)
+    except Exception:
+        return "unknown distribution"
+
+
+def _is_setup_hook(target: Any) -> bool:
+    """
+    Decide whether an entry-point object is a registry setup hook.
+
+    A setup hook is a plain function with exactly one required parameter
+    (the registry, annotated or not) that can be passed positionally.
+
+    :param target: the loaded entry-point object
+    :returns: whether ``target`` should be called with the registry
+    """
+    if isinstance(target, type) or not inspect.isfunction(target):
+        return False
+    try:
+        signature = inspect.signature(target)
+    except (TypeError, ValueError):
+        return False
+    required = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        and parameter.default is inspect.Parameter.empty
+    ]
+    if len(required) != 1:
+        return False
+    # the single required parameter must accept a positional argument
+    return required[0].kind is not inspect.Parameter.KEYWORD_ONLY
 
 
 class Registry:
@@ -346,6 +391,64 @@ class Registry:
             ) from error
         registry: Registry = self
         return loader.load(registry, source, replace=replace)
+
+    def load_entry_points(self, group: str, *, replace: bool = False) -> list[Definition]:
+        """
+        Register services advertised by installed packages via entry points.
+
+        Every entry point in ``group`` is loaded and applied with one of
+        two conventions, decided by what the entry point resolves to:
+
+        - a *setup hook* — a plain function with exactly one required
+          parameter — is called with this registry and may register any
+          number of services itself;
+        - anything else (a class or factory callable) is registered under
+          the entry point's name, exactly like
+          ``register(obj, name=entry_point.name)``.
+
+        Plugins advertise themselves in their ``pyproject.toml``::
+
+            [project.entry-points."myapp.services"]
+            blob-storage = "myapp_blob.storage:BlobStorage"
+            extras = "myapp_extras.plugin:setup"
+
+        Note that a factory function with exactly one required parameter is
+        indistinguishable from a setup hook — give the parameter a default,
+        or use a class or setup hook instead.
+
+        :param group: the entry-point group to scan (e.g. ``"myapp.services"``)
+        :param replace: overwrite colliding registrations instead of raising
+        :returns: the definitions registered by all entry points, in load
+            order (for setup hooks: every definition the hook added)
+        :raises DefinitionError: if an entry point fails to load, resolves
+            to an unusable object, or its registration fails; the error
+            names the entry point and its distribution
+        """
+        self._check_open()
+        registered: list[Definition] = []
+        for entry_point in importlib.metadata.entry_points(group=group):
+            where = f"entry point {entry_point.name!r} of {_distribution_name(entry_point)}"
+            try:
+                target = entry_point.load()
+            except Exception as error:
+                raise DefinitionError(f"{where} failed to load: {error}") from error
+            try:
+                if _is_setup_hook(target):
+                    before = set(self._definitions)
+                    target(self)
+                    registered.extend(
+                        definition for definition in self._definitions if definition not in before
+                    )
+                else:
+                    registered.append(
+                        self.register(target, name=entry_point.name, replace=replace)
+                    )
+            except DefinitionError as error:
+                # keep the subtype (e.g. DuplicateServiceError), add context
+                raise type(error)(f"{where}: {error}") from error
+            except Exception as error:
+                raise DefinitionError(f"{where} failed: {error}") from error
+        return registered
 
     # ---------------------------------------------------------------------- lookup
 
