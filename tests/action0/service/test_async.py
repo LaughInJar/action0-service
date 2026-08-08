@@ -1,5 +1,10 @@
 import asyncio
+import io
+import sys
+import tempfile
+import textwrap
 import unittest
+from pathlib import Path
 
 from action0.service import CircularDependencyError
 from action0.service import Registry
@@ -165,6 +170,62 @@ class SyncMismatchTestCase(unittest.TestCase):
             registry.close()
         self.assertFalse(instance.closed)
         self.assertIn("aclose", captured.output[0])
+
+
+class LazyAsyncTestCase(unittest.IsolatedAsyncioTestCase):
+    """Lazily-loaded YAML definitions detect async factories on import.
+
+    ``is_async`` is unknown until :py:meth:`Definition.materialize` runs, so
+    the sync guard must materialize before deciding — a lazy async factory
+    must not slip through ``get()`` as a bare coroutine object.
+    """
+
+    _tmp: tempfile.TemporaryDirectory  # type: ignore[type-arg]  # 3.11: not generic yet
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Generate an importable module holding an async factory."""
+        cls._tmp = tempfile.TemporaryDirectory()
+        module_path = Path(cls._tmp.name) / "a0svc_async_mod.py"
+        module_path.write_text(
+            textwrap.dedent(
+                '''
+                """Generated services for the lazy-async tests."""
+
+
+                class Session:
+                    pass
+
+
+                async def make_session() -> Session:
+                    return Session()
+                '''
+            )
+        )
+        sys.path.insert(0, cls._tmp.name)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        """Drop the generated module from the path and clean up."""
+        sys.path.remove(cls._tmp.name)
+        sys.modules.pop("a0svc_async_mod", None)
+        cls._tmp.cleanup()
+
+    CATALOG = "session:\n  factory: a0svc_async_mod.make_session\n"
+
+    async def test_aget_materializes_lazy_async_factory(self) -> None:
+        """aget() imports the factory on first use and awaits it."""
+        registry = Registry()
+        registry.load_yaml(io.StringIO(self.CATALOG), lazy=True)
+        instance = await registry.aget("session")
+        self.assertEqual(type(instance).__name__, "Session")
+
+    async def test_sync_get_of_lazy_async_factory_raises(self) -> None:
+        """get() must refuse the factory even though is_async was unknown."""
+        registry = Registry()
+        registry.load_yaml(io.StringIO(self.CATALOG), lazy=True)
+        with self.assertRaisesRegex(ServiceError, "aget"):
+            registry.get("session")
 
 
 class AsyncLifecycleTestCase(unittest.IsolatedAsyncioTestCase):

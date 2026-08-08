@@ -23,6 +23,12 @@ reading tracebacks.
 .. automodule:: action0.service.scopes
 ```
 
+## `action0.service.default`
+
+```{eval-rst}
+.. automodule:: action0.service.default
+```
+
 ## `action0.service.markers`
 
 ```{eval-rst}

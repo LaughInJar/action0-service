@@ -22,7 +22,9 @@ from typing import Annotated
 from typing import Any
 from typing import Union
 
+from action0.service.errors import DefinitionError
 from action0.service.markers import Named
+from action0.service.scopes import _CREATION_LOCK
 
 # Value-ish builtin types that are never resolved from the registry by bare
 # type annotation: injecting "the registered str" into every `host: str`
@@ -56,11 +58,20 @@ class Definition:
     used as dictionary keys in scope stores.
     """
 
-    provider: Callable[..., Any]
-    """The class or factory callable that produces the service instance."""
+    provider: Callable[..., Any] | None
+    """The class or factory callable that produces the service instance.
+
+    ``None`` only while a lazily-loaded YAML definition has not been
+    :py:meth:`materialize`\\ d yet; use :py:meth:`resolved_provider` to read
+    it safely.
+    """
 
     provides: type[Any]
-    """The type this service is registered under (used for type lookups)."""
+    """The type this service is registered under (used for type lookups).
+
+    For unmaterialized lazy definitions this is the ``object`` placeholder;
+    type scans materialize before reading it.
+    """
 
     name: str | None
     """The service name, or ``None`` for an unnamed (default) registration."""
@@ -83,12 +94,20 @@ class Definition:
     introspect: bool = True
     """Whether the provider's signature is inspected for injection."""
 
+    factory_path: str | None = None
+    """Unimported dotted path of a lazily-loaded factory, ``None`` otherwise."""
+
+    provides_path: str | None = None
+    """Unimported dotted path of a lazily-loaded ``provides`` type, if any."""
+
     is_async: bool = field(init=False, default=False)
     """Whether the provider is a coroutine function (``async def`` factory).
 
     Async definitions can only be resolved through the ``a``-prefixed
     registry methods (:py:meth:`~action0.service.registry.Registry.aget`
-    and friends); the sync paths refuse them with a clear error.
+    and friends); the sync paths refuse them with a clear error. Re-detected
+    by :py:meth:`materialize` for lazy definitions, whose provider is not
+    known at construction time.
     """
 
     def __post_init__(self) -> None:
@@ -99,12 +118,91 @@ class Definition:
         """
         Return a short human-readable identifier for error messages.
 
-        :returns: the provided type's name, plus the service name if set
+        :returns: the provided type's name (the factory path while a lazy
+            definition is unmaterialized), plus the service name if set
         """
-        base = getattr(self.provides, "__name__", str(self.provides))
+        if self.factory_path is not None:
+            base = self.factory_path
+        else:
+            base = getattr(self.provides, "__name__", str(self.provides))
         if self.name is not None:
             return f"{base} (name={self.name!r})"
         return base
+
+    def materialize(self) -> None:
+        """
+        Import a lazily-loaded factory (and ``provides``) path, once.
+
+        A no-op for definitions that already carry a provider. Idempotent
+        and thread-safe: the import happens under the same process-wide
+        creation lock the scopes use, so no lock-ordering issues can arise.
+
+        :raises DefinitionError: if a dotted path cannot be imported, the
+            factory is not callable, or the provided type cannot be
+            determined — prefixed with the service name for context
+        """
+        if self.factory_path is None:
+            return
+        with _CREATION_LOCK:
+            if self.factory_path is None:  # another thread was faster
+                return
+            # deferred import: lazy definitions only ever come from the
+            # loader, so PyYAML was importable when they were created
+            from action0.service.loader import import_from_path
+
+            context = self.name if self.name is not None else self.factory_path
+            try:
+                provider = import_from_path(self.factory_path)
+                if not callable(provider):
+                    raise DefinitionError(f"{self.factory_path!r} is not callable")
+                if self.provides_path is not None:
+                    provides_object = import_from_path(self.provides_path)
+                    if not isinstance(provides_object, type):
+                        raise DefinitionError(
+                            f"'provides' path {self.provides_path!r} is not a class"
+                        )
+                    if isinstance(provider, type) and not issubclass(provider, provides_object):
+                        raise DefinitionError(
+                            f"{provider.__name__} is not a subclass of "
+                            f"provides={provides_object.__name__}"
+                        )
+                    provides = provides_object
+                elif self.name is None:
+                    # anonymous nested factory: never type-looked-up, so an
+                    # uninferrable provided type falls back to object (as in
+                    # the non-lazy loader path)
+                    provides = infer_provides(provider) or object
+                else:
+                    inferred = infer_provides(provider)
+                    if inferred is None:
+                        raise DefinitionError(
+                            f"cannot infer the provided type of {provider!r}: add a "
+                            "return annotation to the factory or set 'provides'"
+                        )
+                    provides = inferred
+            except DefinitionError as error:
+                raise DefinitionError(f"{context}: {error}") from error
+            self.provider = provider
+            self.provides = provides
+            self.factory_path = None
+            self.provides_path = None
+            # the lazy constructor ran __post_init__ with provider=None
+            self.is_async = inspect.iscoroutinefunction(provider)
+
+    def resolved_provider(self) -> Callable[..., Any]:
+        """
+        Return the provider, importing lazily-loaded paths first.
+
+        :returns: the class or factory callable
+        :raises DefinitionError: if a lazy path cannot be imported
+        """
+        self.materialize()
+        provider = self.provider
+        if provider is None:
+            # materialize() either fills the provider or raises, and eager
+            # definitions are constructed with one — defensive only
+            raise DefinitionError(f"{self.label()}: definition has no provider")
+        return provider
 
 
 @dataclass(frozen=True)
