@@ -199,3 +199,49 @@ parent's, an explicit value overrides them). Activity is always judged
 by the registry layer that *owns* the definition: a parent's `prod`
 service stays visible to a `dev` child as long as it is active in the
 parent.
+
+## Plugin discovery
+
+{py:meth}`~action0.service.registry.Registry.load_entry_points` pulls in
+services advertised by *other installed packages* via [entry
+points](https://packaging.python.org/en/latest/specifications/entry-points/).
+A plugin declares its services in its own `pyproject.toml`:
+
+```toml
+[project.entry-points."myapp.services"]
+s3-storage = "myapp_s3.storage:S3Storage"
+extras = "myapp_extras.plugin:setup"
+```
+
+and the application collects everything installed into its registry:
+
+```python
+registry.load_entry_points("myapp.services")
+```
+
+Each entry point is applied with one of two conventions, decided by what
+it resolves to:
+
+- a **setup hook** — a plain function with exactly one required
+  parameter — is called with the registry and may register any number of
+  services itself:
+
+  ```python
+  def setup(registry):
+      registry.register(S3Storage, name="s3")
+      registry.register_instance(load_config(), name="s3-config")
+  ```
+
+- anything else (a class or factory callable) is registered under the
+  entry point's name, exactly like `register(obj, name="s3-storage")`.
+
+The method returns every definition that was registered — including
+those added by setup hooks — and raises
+{py:class}`~action0.service.errors.DefinitionError` naming the entry
+point and its distribution if one fails to load or register; nothing is
+skipped silently. Colliding names follow the usual rules: pass
+`replace=True` to overwrite instead of raising.
+
+One caveat: a factory function with exactly one required parameter looks
+like a setup hook. Give the parameter a default value, or expose a class
+or setup hook instead.

@@ -133,6 +133,39 @@ gb.idealo:
   api_key: !ENV ${IDEALO_KEY}
 ```
 
+## Lazy loading
+
+By default every `factory` and `provides` path is imported while the
+catalog loads. For a large catalog that can mean importing your whole
+application at boot even though most services are never used in a given
+process. `lazy=True` defers the imports:
+
+```python
+registry.load_yaml("conf/services.yaml", lazy=True)
+```
+
+Loading then imports nothing; each definition resolves its dotted paths
+on first use instead:
+
+- **Building the service** — a by-name `get("db")` imports only that
+  service's factory (plus, transitively, its dependencies), nothing
+  else.
+- **Type-based lookups** — resolving by type needs the real `provides`
+  types, so the first type query (a `get(SomeType)`, injection by
+  annotation, `get_all`, …) imports all still-lazy definitions of the
+  consulted registry layer.
+- {py:meth}`~action0.service.registry.Registry.validate` imports
+  everything — a broken dotted path becomes a validation problem naming
+  the service, so calling it at boot keeps the fail-fast behavior while
+  still skipping unused imports in processes that don't validate.
+- {py:meth}`~action0.service.registry.Registry.warmup` imports and
+  builds the `eager` definitions.
+
+Nested anonymous factories stay lazy too: their paths are imported when
+the owning service is built. Without `validate()`, an unimportable path
+surfaces as {py:class}`~action0.service.errors.DefinitionError` at
+first use.
+
 ## Security
 
 Parsing uses a {py:class}`yaml.SafeLoader` subclass, so documents

@@ -90,3 +90,44 @@ overriding in a long-lived one. And override on the registry that
 parent's world, so an override declared on a child cannot reach them
 (shadow with a child registration instead, as in the example at the
 top).
+
+## The process-wide default registry
+
+Explicit registries compose better and are easier to test — pass them
+around where you can, especially in library code. But an application or
+script often has exactly one registry anyway, and for that case
+{py:func}`~action0.service.default.default_registry` holds a
+process-wide instance, created lazily on first access:
+
+```python
+from action0.service import default_registry
+
+default_registry().register(Database)
+default_registry().get(Database).dsn  # 'sqlite://'
+```
+
+It is never closed automatically; closing it is the application's
+responsibility. {py:func}`~action0.service.default.set_default_registry`
+installs a replacement and returns the previous instance — pass `None`
+to reset, e.g. after closing, so the next access starts fresh:
+
+```python
+default_registry().close()
+set_default_registry(None)  # next default_registry() creates a new one
+```
+
+Code under test that relies on `default_registry()` is exercised with
+{py:func}`~action0.service.default.using_default_registry`, which swaps
+in a replacement and restores the previous default afterwards — combine
+it with a registry context manager so instances are disposed too:
+
+```python
+from action0.service import Registry, using_default_registry
+
+with Registry() as registry, using_default_registry(registry):
+    registry.register_instance(FakeDatabase(), provides=Database)
+    code_under_test()  # sees the fake through default_registry()
+```
+
+Because this is process-global state, such tests cannot run
+concurrently with other tests touching the default registry.
