@@ -58,6 +58,14 @@ shop.catalog:
   (their mapping key), so none is a default implementation unless
   marked.
 
+`profiles`
+: A string or list of strings limiting the definition to those
+  [profiles](registration.md#profiles-devprod-variants); it is only
+  visible in registries whose active profiles intersect. YAML mapping
+  keys must be unique, so dev/prod variants of the *same* service name
+  live in separate files (or separate `load_yaml()` calls) — loading
+  both into one registry works when their profiles are disjoint.
+
 `params`
 : An escape hatch: a mapping passed through as constructor parameters
   *without* reserved-key screening — for constructors whose parameter
