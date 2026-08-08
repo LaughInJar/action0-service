@@ -1,5 +1,6 @@
 """Tests for profile-limited registrations and profile-aware resolution."""
 
+import asyncio
 import io
 import unittest
 
@@ -188,6 +189,13 @@ class ProfileLifecycleTestCase(unittest.TestCase):
         registry.register(DevDatabase, name="dev", profiles=["dev"], eager=True)
         registry.register(ProdDatabase, name="prod", profiles=["prod"], eager=True)
         instances = registry.warmup()
+        self.assertEqual([type(instance) for instance in instances], [DevDatabase])
+
+    def test_awarmup_skips_inactive(self) -> None:
+        registry = Registry(profiles=["dev"])
+        registry.register(DevDatabase, name="dev", profiles=["dev"], eager=True)
+        registry.register(ProdDatabase, name="prod", profiles=["prod"], eager=True)
+        instances = asyncio.run(registry.awarmup())
         self.assertEqual([type(instance) for instance in instances], [DevDatabase])
 
     def test_validate_skips_inactive(self) -> None:

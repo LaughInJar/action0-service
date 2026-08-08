@@ -80,3 +80,36 @@ Registries are context managers; `with Registry() as registry:` calls
 After closing, any use of the registry raises
 {py:class}`~action0.service.errors.ServiceError`. Closing twice is
 fine (the second call is a no-op).
+
+## Async lifecycle
+
+Every lifecycle entry point has an async twin:
+{py:meth}`~action0.service.registry.Registry.awarmup`,
+{py:meth}`~action0.service.registry.Registry.aclose`, and `async with`
+(which calls `aclose()` on exit). Use them whenever the registry holds
+[async services](registration.md#async-factories) — the sync methods
+refuse async definitions, and sync `close()` cannot await an async
+disposer.
+
+```python
+async def main() -> None:
+    async with Registry() as registry:
+        registry.register(make_pool)  # an async factory, eager or not
+        registry.validate()
+        await registry.awarmup()
+        # ... run the application ...
+```
+
+Teardown rules match `close()`, with one addition: a managed instance
+offering an **`aclose()`** method gets that *awaited*, in preference to
+a sync `close()`. The reverse-creation order, the managed-only rule,
+and the log-don't-raise error handling are the same.
+
+The sync `close()` skips instances that only have an async `aclose()` —
+it cannot await them — and logs a warning naming the service, so a
+forgotten `aclose()` shows up in the logs rather than as a silent leak.
+
+One registry with async services is meant to be driven from a single
+event loop: concurrent first requests within that loop are
+deduplicated, but the async machinery does not coordinate across
+loops or with concurrent sync resolution from other threads.

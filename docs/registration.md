@@ -200,6 +200,41 @@ by the registry layer that *owns* the definition: a parent's `prod`
 service stays visible to a `dev` child as long as it is active in the
 parent.
 
+## Async factories
+
+A factory may be an `async def` function; it is registered exactly like
+a sync one (the return annotation still names the provided type), but it
+can only be *resolved* through the `a`-prefixed methods —
+{py:meth}`~action0.service.registry.Registry.aget`,
+{py:meth}`~action0.service.registry.Registry.afind`,
+{py:meth}`~action0.service.registry.Registry.aget_all`,
+{py:meth}`~action0.service.registry.Registry.abuild`:
+
+```python
+async def make_pool(config: Config) -> ConnectionPool:
+    return await ConnectionPool.connect(config.dsn)
+
+
+registry.register(make_pool)  # scopes, names, params: as usual
+pool = await registry.aget(ConnectionPool)
+```
+
+Scopes, names, `params`, and injection behave exactly as for sync
+providers, and the caches are shared: a singleton built by `aget()` is
+the same instance a later sync `get()` returns. The sync methods refuse
+to resolve an async definition — including one buried as a dependency —
+with a {py:class}`~action0.service.errors.ServiceError` pointing at
+`aget()`. The reverse works, though: `aget()` happily resolves sync
+definitions, so async code can use it throughout, and a *sync* class
+depending on an async service resolves fine via `aget()`.
+
+{py:meth}`~action0.service.registry.Registry.inject` is async-aware as
+well: decorating an `async def` function yields an async wrapper that
+resolves sentinel parameters through the async paths.
+
+See [Async lifecycle](lifecycle.md#async-lifecycle) for eager
+construction (`awarmup()`) and disposal (`aclose()`, `async with`).
+
 ## Plugin discovery
 
 {py:meth}`~action0.service.registry.Registry.load_entry_points` pulls in
