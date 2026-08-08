@@ -26,7 +26,7 @@ class Ref:
     ``!ref`` tag in YAML) and it is replaced with the referenced service when
     the depending service is built::
 
-        registry.register(Importer, params={"catalog": Ref("catalog.eu")})
+        registry.register(Importer, params={"catalog": Ref("catalog.primary")})
 
     :param key: the service name, or a type to resolve the default
         implementation for.

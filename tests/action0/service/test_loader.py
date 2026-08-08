@@ -143,7 +143,7 @@ class LoadYamlTestCase(unittest.TestCase):
     def test_name_is_a_plain_init_param(self) -> None:
         """
         Unlike the reserved keys, ``name`` flows into the constructor
-        (some catalogs rely on this).
+        (catalogs whose factories take the service name rely on this).
         """
         registry = Registry()
         self.load(
@@ -287,17 +287,17 @@ class LoadYamlTestCase(unittest.TestCase):
 
             main:
               <<: *base
-              name: shop
+              name: main
 
-            de:
+            mirror:
               <<: *base
-              name: de
+              name: mirror
             """,
         )
-        self.assertEqual([d.name for d in definitions], ["database", "shop", "de"])
+        self.assertEqual([d.name for d in definitions], ["database", "main", "mirror"])
         self.assertNotIn(".base", registry)
-        self.assertEqual(registry.get("shop").name, "shop")
-        self.assertIs(registry.get("shop").db, registry.get("de").db)
+        self.assertEqual(registry.get("main").name, "main")
+        self.assertIs(registry.get("main").db, registry.get("mirror").db)
 
     def test_scope_key(self) -> None:
         """
