@@ -13,6 +13,7 @@ from action0.service import DefinitionError
 from action0.service import DuplicateServiceError
 from action0.service import Registry
 from action0.service import ServiceNotFoundError
+from action0.service import ValidationError
 from action0.service.loader import import_from_path
 
 # The YAML loader imports factories by dotted path, so the test services
@@ -484,3 +485,206 @@ class LoadYamlTestCase(unittest.TestCase):
             """,
         )
         registry.validate()
+
+
+class LazyLoadTestCase(unittest.TestCase):
+    """
+    tests for ``Registry.load_yaml(..., lazy=True)``
+
+    Each test generates a module under a fresh, unique name so that
+    ``sys.modules`` membership reliably shows whether loading imported it.
+    """
+
+    counter = 0
+
+    def fresh_module(self) -> str:
+        """
+        Generate the standard services module under a new unique name.
+
+        :returns: the generated module's name (not yet imported)
+        """
+        type(self).counter += 1
+        name = f"a0svc_lazy_mod_{self.counter}"
+        Path(_TMP.name, f"{name}.py").write_text(_MODULE_SOURCE, encoding="utf-8")
+        self.assertNotIn(name, sys.modules)
+        return name
+
+    def load(self, registry: Registry, text: str, **kwargs: Any) -> list[Definition]:
+        """
+        Load a dedented YAML snippet with ``lazy=True``.
+
+        :param registry: the registry to load into
+        :param text: the YAML document (indented triple-quoted string)
+        :param kwargs: forwarded to ``load_yaml``
+        :returns: the registered definitions
+        """
+        kwargs.setdefault("lazy", True)
+        return registry.load_yaml(io.StringIO(textwrap.dedent(text)), **kwargs)
+
+    def test_load_imports_nothing_build_imports(self) -> None:
+        """
+        Lazy loading leaves the factory module unimported until first
+        ``get`` by name; the built service behaves normally afterwards.
+        """
+        module = self.fresh_module()
+        registry = Registry()
+        self.load(
+            registry,
+            f"""
+            database:
+              factory: {module}.Database
+              dsn: pg://lazy
+            """,
+        )
+        self.assertNotIn(module, sys.modules)
+        database = registry.get("database")
+        self.assertIn(module, sys.modules)
+        self.assertEqual(database.dsn, "pg://lazy")
+        self.assertIs(registry.get("database"), database)
+
+    def test_type_lookup_materializes(self) -> None:
+        """
+        A type-based query imports still-lazy definitions first (their
+        provided types are needed for the scan).
+        """
+        module = self.fresh_module()
+        registry = Registry()
+        self.load(
+            registry,
+            f"""
+            database:
+              factory: {module}.Database
+            """,
+        )
+        self.assertNotIn(module, sys.modules)
+        found = registry.find(object)
+        self.assertIn(module, sys.modules)
+        self.assertEqual(type(found).__name__, "Database")
+
+    def test_lazy_provides_path(self) -> None:
+        """
+        A lazy ``provides`` path resolves on first use like the factory.
+        """
+        module = self.fresh_module()
+        registry = Registry()
+        self.load(
+            registry,
+            f"""
+            database:
+              factory: {module}.Postgres
+              provides: {module}.Database
+            """,
+        )
+        self.assertNotIn(module, sys.modules)
+        base = import_from_path(f"{module}.Database")
+        self.assertIsInstance(registry.get(base), import_from_path(f"{module}.Postgres"))
+
+    def test_validate_reports_lazy_import_errors(self) -> None:
+        """
+        ``validate()`` imports lazy definitions and reports every dotted
+        path that does not resolve, naming the service.
+        """
+        module = self.fresh_module()
+        registry = Registry()
+        self.load(
+            registry,
+            f"""
+            broken:
+              factory: no.such.module.Thing
+
+            unannotated:
+              factory: {module}.unannotated_factory
+            """,
+        )
+        with self.assertRaises(ValidationError) as caught:
+            registry.validate()
+        message = str(caught.exception)
+        self.assertIn("broken:", message)
+        self.assertIn("unannotated:", message)
+        # the bad path also raises at first use, naming the service
+        with self.assertRaises(DefinitionError) as built:
+            registry.get("broken")
+        self.assertIn("broken:", str(built.exception))
+
+    def test_validate_materializes_good_paths(self) -> None:
+        """
+        ``validate()`` on a healthy lazy catalog imports it and passes.
+        """
+        module = self.fresh_module()
+        registry = Registry()
+        self.load(
+            registry,
+            f"""
+            database:
+              factory: {module}.Database
+
+            catalog:
+              factory: {module}.Catalog
+              name: main
+              db: !ref database
+            """,
+        )
+        self.assertNotIn(module, sys.modules)
+        registry.validate()
+        self.assertIn(module, sys.modules)
+
+    def test_nested_factories_stay_lazy(self) -> None:
+        """
+        Anonymous nested factories inside a lazy definition are imported
+        only when the owning service is built.
+        """
+        module = self.fresh_module()
+        registry = Registry()
+        self.load(
+            registry,
+            f"""
+            catalog:
+              factory: {module}.Catalog
+              name: main
+              db:
+                factory: {module}.Database
+                dsn: nested://
+            """,
+        )
+        self.assertNotIn(module, sys.modules)
+        catalog = registry.get("catalog")
+        self.assertEqual(catalog.db.dsn, "nested://")
+
+    def test_replace_and_duplicates_without_import(self) -> None:
+        """
+        Duplicate handling works on lazy definitions and never triggers
+        an import by itself.
+        """
+        module = self.fresh_module()
+        registry = Registry()
+        document = f"""
+        database:
+          factory: {module}.Database
+        """
+        self.load(registry, document)
+        with self.assertRaises(DuplicateServiceError):
+            self.load(registry, document)
+        self.load(registry, document, replace=True)
+        self.assertEqual(len(registry), 1)
+        self.assertNotIn(module, sys.modules)
+        self.assertEqual(registry.get("database").dsn, "sqlite://")
+
+    def test_eager_lazy_builds_on_warmup(self) -> None:
+        """
+        ``warmup()`` imports and builds eager lazy definitions.
+        """
+        module = self.fresh_module()
+        registry = Registry()
+        self.load(
+            registry,
+            f"""
+            database:
+              factory: {module}.Database
+              eager: true
+            """,
+        )
+        self.assertNotIn(module, sys.modules)
+        instances = registry.warmup()
+        self.assertIn(module, sys.modules)
+        self.assertEqual(len(instances), 1)
+        self.assertIs(registry.get("database"), instances[0])
