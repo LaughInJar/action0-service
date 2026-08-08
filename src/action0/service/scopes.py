@@ -11,16 +11,25 @@ their string values, e.g. in YAML files):
 
 Custom scopes are plain :py:class:`ScopePolicy` subclasses registered with
 :py:meth:`action0.service.registry.Registry.register_scope`.
+
+Every policy also has an async twin, :py:meth:`ScopePolicy.aget`, used by
+the ``a``-prefixed registry methods. The built-in caching scopes dedupe
+concurrent first builds with :py:class:`asyncio.Lock` instances; an async
+registry is meant to be driven from a single event loop.
 """
 
+import asyncio
 import contextvars
 import enum
 import threading
 from abc import ABC
 from abc import abstractmethod
+from collections.abc import Awaitable
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 from typing import Any
+
+from action0.service.errors import ScopeError
 
 if TYPE_CHECKING:  # avoid a runtime import cycle; only needed for annotations
     from action0.service.definitions import Definition
@@ -77,6 +86,27 @@ class ScopePolicy(ABC):
         :returns: the (new or cached) service instance
         """
 
+    async def aget(self, definition: "Definition", abuild: Callable[[], Awaitable[Any]]) -> Any:
+        """
+        Async twin of :py:meth:`get`, used by the registry's ``a`` methods.
+
+        The default implementation only fits non-caching scopes (it builds
+        fresh every time); caching scopes must override it so that stored
+        instances are found and concurrent first builds are deduplicated.
+
+        :param definition: the definition being resolved
+        :param abuild: zero-argument coroutine function producing a new
+            instance
+        :returns: the (new or cached) service instance
+        :raises ScopeError: on a caching policy that did not override this
+        """
+        if self.caches:
+            raise ScopeError(
+                f"scope policy {type(self).__name__} caches instances but does not "
+                "override aget(); async resolution is not supported for it"
+            )
+        return await abuild()
+
     def drain(self) -> list[tuple["Definition", Any]]:
         """
         Hand over all stored instances *visible from the calling thread and
@@ -94,6 +124,7 @@ class SingletonScope(ScopePolicy):
     def __init__(self) -> None:
         """Set up the (insertion-ordered) instance store."""
         self._instances: dict[Definition, Any] = {}
+        self._async_locks: dict[Definition, asyncio.Lock] = {}
 
     def get(self, definition: "Definition", build: Callable[[], Any]) -> Any:
         """Return the stored instance, building it under the creation lock once."""
@@ -105,6 +136,32 @@ class SingletonScope(ScopePolicy):
             # double-checked: another thread may have built it while we waited
             if definition not in self._instances:
                 self._instances[definition] = build()
+            return self._instances[definition]
+
+    async def aget(self, definition: "Definition", abuild: Callable[[], Awaitable[Any]]) -> Any:
+        """
+        Return the stored instance, building it at most once per definition.
+
+        Concurrent first requests from several tasks are deduplicated with a
+        lazily created per-definition :py:class:`asyncio.Lock`. The threading
+        creation lock is only held for the lock bookkeeping — never across an
+        ``await`` — so async builds cannot stall other threads.
+        """
+        try:
+            return self._instances[definition]
+        except KeyError:
+            pass
+        with _CREATION_LOCK:  # no await in here
+            lock = self._async_locks.get(definition)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._async_locks[definition] = lock
+        async with lock:
+            # double-checked: another task may have built it while we waited
+            if definition not in self._instances:
+                instance = await abuild()
+                with _CREATION_LOCK:
+                    self._instances.setdefault(definition, instance)
             return self._instances[definition]
 
     def drain(self) -> list[tuple["Definition", Any]]:
@@ -148,6 +205,34 @@ class ThreadScope(ScopePolicy):
             store[definition] = build()
         return store[definition]
 
+    async def aget(self, definition: "Definition", abuild: Callable[[], Awaitable[Any]]) -> Any:
+        """
+        Return the calling thread's instance, building it at most once.
+
+        All tasks of one event loop run on the loop's thread and therefore
+        share this thread's store, so concurrent first requests are
+        deduplicated with per-definition :py:class:`asyncio.Lock` objects
+        kept in the same thread-local (no threading lock needed: only this
+        thread ever touches them).
+        """
+        store = self._store()
+        try:
+            return store[definition]
+        except KeyError:
+            pass
+        locks: dict[Definition, asyncio.Lock] | None = getattr(self._local, "async_locks", None)
+        if locks is None:
+            locks = {}
+            self._local.async_locks = locks
+        lock = locks.get(definition)
+        if lock is None:  # atomic: no await between the lookup and the store
+            lock = asyncio.Lock()
+            locks[definition] = lock
+        async with lock:
+            if definition not in store:
+                store[definition] = await abuild()
+            return store[definition]
+
     def drain(self) -> list[tuple["Definition", Any]]:
         """Return the *calling thread's* instances (other threads' survive)."""
         store = self._store()
@@ -185,6 +270,21 @@ class ContextScope(ScopePolicy):
         instance = var.get(_MISSING)
         if instance is _MISSING:
             instance = build()
+            var.set(instance)
+        return instance
+
+    async def aget(self, definition: "Definition", abuild: Callable[[], Awaitable[Any]]) -> Any:
+        """
+        Return the current context's instance, building it on first use.
+
+        No deduplication lock is needed: every asyncio task runs in its own
+        context copy, so concurrent tasks build (and keep) their own
+        instances — that is exactly the scope's task-local semantics.
+        """
+        var = self._var(definition)
+        instance = var.get(_MISSING)
+        if instance is _MISSING:
+            instance = await abuild()
             var.set(instance)
         return instance
 
