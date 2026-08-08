@@ -32,6 +32,10 @@ Supported YAML conveniences:
   cannot change type behind your back).
 - If a constructor parameter is itself named like a reserved key, put it
   under the ``params:`` mapping, which is passed through verbatim.
+- With ``lazy=True`` the ``factory``/``provides`` dotted paths (including
+  those of nested anonymous factories) are not imported at load time but on
+  first use — see
+  :py:meth:`~action0.service.registry.Registry.load_yaml`.
 
 Parsing uses a :py:class:`yaml.SafeLoader` subclass, so documents cannot
 instantiate arbitrary Python objects *during parsing* — but ``factory``
@@ -156,6 +160,7 @@ def load(
     source: "str | os.PathLike[str] | IO[str]",
     *,
     replace: bool = False,
+    lazy: bool = False,
 ) -> list[Definition]:
     """
     Parse a YAML document and register every service it defines.
@@ -163,6 +168,8 @@ def load(
     :param registry: the registry to register into
     :param source: a file path, or an open text stream containing YAML
     :param replace: overwrite colliding registrations instead of raising
+    :param lazy: defer importing ``factory``/``provides`` paths until the
+        definitions are first used
     :returns: the registered definitions, in document order
     :raises DefinitionError: if the document or a definition is malformed
     """
@@ -184,12 +191,12 @@ def load(
             continue
         if not isinstance(node, dict):
             raise DefinitionError(f"{key}: the definition must be a mapping")
-        created.append(_register_one(registry, key, node, replace=replace))
+        created.append(_register_one(registry, key, node, replace=replace, lazy=lazy))
     return created
 
 
 def _register_one(
-    registry: "Registry", key: str, node: dict[Any, Any], *, replace: bool
+    registry: "Registry", key: str, node: dict[Any, Any], *, replace: bool, lazy: bool
 ) -> Definition:
     """
     Register a single YAML definition.
@@ -198,6 +205,7 @@ def _register_one(
     :param key: the service name (the definition's mapping key)
     :param node: the parsed definition mapping
     :param replace: overwrite colliding registrations instead of raising
+    :param lazy: keep the dotted paths unimported for now
     :returns: the registered definition
     :raises DefinitionError: if the definition is malformed
     """
@@ -205,7 +213,7 @@ def _register_one(
     factory_path = spec.pop("factory", None)
     if not isinstance(factory_path, str):
         raise DefinitionError(f"{key}: 'factory' (a dotted path string) is required")
-    provider = _import_factory(key, factory_path)
+    provider = None if lazy else _import_factory(key, factory_path)
     scope = spec.pop("scope", Scope.SINGLETON.value)
     if not isinstance(scope, str):
         raise DefinitionError(f"{key}: 'scope' must be a string")
@@ -214,13 +222,33 @@ def _register_one(
     if provides_path is not None:
         if not isinstance(provides_path, str):
             raise DefinitionError(f"{key}: 'provides' must be a dotted path string")
-        provides_object = _import_factory(key, provides_path)
-        if not isinstance(provides_object, type):
-            raise DefinitionError(f"{key}: 'provides' must point to a class")
-        provides = provides_object
+        if not lazy:
+            provides_object = _import_factory(key, provides_path)
+            if not isinstance(provides_object, type):
+                raise DefinitionError(f"{key}: 'provides' must point to a class")
+            provides = provides_object
     default = bool(spec.pop("default", False))
     eager = bool(spec.pop("eager", False))
-    params = _pop_params(key, spec)
+    params = _pop_params(key, spec, lazy=lazy)
+    if lazy:
+        # register the unimported dotted paths; Definition.materialize()
+        # resolves them on first use. _scope_key/_add are the registration
+        # internals behind Registry.register() — used directly because
+        # there is no provider to pass yet.
+        definition = Definition(
+            provider=None,
+            provides=object,
+            name=key,
+            scope=registry._scope_key(scope),
+            params=params,
+            default=default,
+            eager=eager,
+            factory_path=factory_path,
+            provides_path=provides_path,
+        )
+        registry._add(definition, replace=replace)
+        return definition
+    assert provider is not None  # lazy returned above; non-lazy imported it
     try:
         return registry.register(
             provider,
@@ -239,7 +267,7 @@ def _register_one(
         raise DefinitionError(f"{key}: {error}") from error
 
 
-def _pop_params(key: str, spec: dict[Any, Any]) -> dict[str, Any]:
+def _pop_params(key: str, spec: dict[Any, Any], *, lazy: bool) -> dict[str, Any]:
     """
     Combine flat parameter keys with an explicit ``params:`` mapping.
 
@@ -248,6 +276,7 @@ def _pop_params(key: str, spec: dict[Any, Any]) -> dict[str, Any]:
 
     :param key: the service name, for error messages
     :param spec: the definition mapping with reserved keys already removed
+    :param lazy: keep nested factory paths unimported for now
     :returns: the transformed parameter mapping
     :raises DefinitionError: if ``params`` is not a mapping or keys clash
     """
@@ -258,7 +287,7 @@ def _pop_params(key: str, spec: dict[Any, Any]) -> dict[str, Any]:
     for param_key, value in spec.items():
         if not isinstance(param_key, str):
             raise DefinitionError(f"{key}: parameter name {param_key!r} is not a string")
-        params[param_key] = _transform(key, value)
+        params[param_key] = _transform(key, value, lazy=lazy)
     if explicit:
         for param_key, value in explicit.items():
             if not isinstance(param_key, str):
@@ -267,11 +296,11 @@ def _pop_params(key: str, spec: dict[Any, Any]) -> dict[str, Any]:
                 raise DefinitionError(
                     f"{key}: parameter {param_key!r} is given both flat and under 'params'"
                 )
-            params[param_key] = _transform(key, value)
+            params[param_key] = _transform(key, value, lazy=lazy)
     return params
 
 
-def _transform(key: str, value: Any) -> Any:
+def _transform(key: str, value: Any, *, lazy: bool) -> Any:
     """
     Recursively prepare a parameter value from the parsed YAML.
 
@@ -281,27 +310,30 @@ def _transform(key: str, value: Any) -> Any:
 
     :param key: the service name, for error messages
     :param value: the parsed YAML value
+    :param lazy: keep nested factory paths unimported for now
     :returns: the transformed value
     :raises DefinitionError: if a nested factory is malformed
     """
     if isinstance(value, dict):
         if "factory" in value:
-            return _anonymous_factory(key, value)
-        return {item_key: _transform(key, item) for item_key, item in value.items()}
+            return _anonymous_factory(key, value, lazy=lazy)
+        return {item_key: _transform(key, item, lazy=lazy) for item_key, item in value.items()}
     if isinstance(value, list):
-        return [_transform(key, item) for item in value]
+        return [_transform(key, item, lazy=lazy) for item in value]
     return value
 
 
-def _anonymous_factory(key: str, node: dict[Any, Any]) -> AnonymousFactory:
+def _anonymous_factory(key: str, node: dict[Any, Any], *, lazy: bool) -> AnonymousFactory:
     """
     Turn a nested ``factory:`` mapping into an anonymous definition.
 
     Inside nested factories only ``factory`` and ``params`` are reserved;
-    everything else is a constructor parameter.
+    everything else is a constructor parameter. With ``lazy=True`` the
+    nested path is imported when the owning service is first built.
 
     :param key: the owning service name, for error messages
     :param node: the nested mapping
+    :param lazy: keep the nested factory path unimported for now
     :returns: the wrapped, unregistered definition
     :raises DefinitionError: if the nested factory is malformed
     """
@@ -309,7 +341,7 @@ def _anonymous_factory(key: str, node: dict[Any, Any]) -> AnonymousFactory:
     factory_path = spec.pop("factory")
     if not isinstance(factory_path, str):
         raise DefinitionError(f"{key}: nested 'factory' must be a dotted path string")
-    provider = _import_factory(key, factory_path)
+    provider = None if lazy else _import_factory(key, factory_path)
     explicit = spec.pop("params", None)
     if explicit is not None and not isinstance(explicit, dict):
         raise DefinitionError(f"{key}: nested 'params' must be a mapping")
@@ -317,10 +349,10 @@ def _anonymous_factory(key: str, node: dict[Any, Any]) -> AnonymousFactory:
     for param_key, value in spec.items():
         if not isinstance(param_key, str):
             raise DefinitionError(f"{key}: parameter name {param_key!r} is not a string")
-        params[param_key] = _transform(key, value)
+        params[param_key] = _transform(key, value, lazy=lazy)
     if explicit:
         for param_key, value in explicit.items():
-            params[param_key] = _transform(key, value)
+            params[param_key] = _transform(key, value, lazy=lazy)
     provides = provider if isinstance(provider, type) else object
     definition = Definition(
         provider=provider,
@@ -328,6 +360,7 @@ def _anonymous_factory(key: str, node: dict[Any, Any]) -> AnonymousFactory:
         name=None,
         scope=Scope.TRANSIENT.value,
         params=params,
+        factory_path=factory_path if lazy else None,
     )
     return AnonymousFactory(definition)
 

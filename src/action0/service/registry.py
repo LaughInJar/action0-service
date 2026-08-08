@@ -321,16 +321,31 @@ class Registry:
         self._scopes[key] = policy
 
     def load_yaml(
-        self, source: "str | os.PathLike[str] | IO[str]", *, replace: bool = False
+        self,
+        source: "str | os.PathLike[str] | IO[str]",
+        *,
+        replace: bool = False,
+        lazy: bool = False,
     ) -> list[Definition]:
         """
         Load service definitions from a YAML file (requires PyYAML).
 
         See :py:mod:`action0.service.loader` for the accepted format.
 
+        With ``lazy=True`` the ``factory`` and ``provides`` dotted paths are
+        *not* imported at load time. Each definition imports them on first
+        use: when the service is built (by-name lookups import nothing
+        else), when any type-based lookup consults the registry layer (type
+        scans need the real provided types, so they import all still-lazy
+        definitions of that layer), and during :py:meth:`validate` and
+        :py:meth:`warmup`. Import errors then surface as
+        :py:class:`~action0.service.errors.DefinitionError` naming the
+        service — call :py:meth:`validate` at boot to collect them early.
+
         :param source: a file path, or an open text stream (e.g.
             :py:class:`io.StringIO`) containing the YAML document
         :param replace: overwrite colliding registrations instead of raising
+        :param lazy: defer importing factory paths until first use
         :returns: the definitions that were registered, in file order
         :raises ServiceError: if PyYAML is not installed
         :raises DefinitionError: if the document is malformed
@@ -345,7 +360,7 @@ class Registry:
                 "Registry.load_yaml() requires PyYAML — install 'action0-service[yaml]'"
             ) from error
         registry: Registry = self
-        return loader.load(registry, source, replace=replace)
+        return loader.load(registry, source, replace=replace, lazy=lazy)
 
     # ---------------------------------------------------------------------- lookup
 
@@ -763,6 +778,11 @@ class Registry:
         for definition in reversed(self._overrides):
             if issubclass(definition.provides, requested):
                 return definition, self
+        # type scans need the real provided types, so lazily-loaded YAML
+        # definitions of this layer are imported first (by-name lookups
+        # leave them untouched)
+        for definition in self._definitions:
+            definition.materialize()
         local_candidates = [
             definition
             for definition in self._definitions
@@ -814,6 +834,9 @@ class Registry:
         collected: list[tuple[Definition, Registry]] = (
             self._parent._collect_by_type(requested) if self._parent is not None else []
         )
+        # like _find_by_type: type scans import still-lazy definitions
+        for definition in self._definitions:
+            definition.materialize()
         collected += [
             (definition, self)
             for definition in self._definitions
@@ -875,12 +898,15 @@ class Registry:
             raise CircularDependencyError(" -> ".join(link.label() for link in chain))
         stack.append(definition)
         try:
-            args, kwargs = self._resolve_arguments(definition)
-            return definition.provider(*args, **kwargs)
+            provider = definition.resolved_provider()
+            args, kwargs = self._resolve_arguments(definition, provider)
+            return provider(*args, **kwargs)
         finally:
             stack.pop()
 
-    def _resolve_arguments(self, definition: Definition) -> tuple[list[Any], dict[str, Any]]:
+    def _resolve_arguments(
+        self, definition: Definition, provider: Callable[..., Any]
+    ) -> tuple[list[Any], dict[str, Any]]:
         """
         Determine the call arguments for a definition's provider.
 
@@ -888,6 +914,7 @@ class Registry:
         annotation; remaining ones fall back to provider defaults.
 
         :param definition: the definition being built
+        :param provider: the definition's (materialized) provider
         :returns: positional arguments and keyword arguments
         :raises DefinitionError: for unknown param keys or unfillable
             positional-only parameters
@@ -895,7 +922,7 @@ class Registry:
         """
         if not definition.introspect:
             return [], {}
-        spec = provider_spec(definition.provider)
+        spec = provider_spec(provider)
         params = definition.params
         if not spec.introspectable:
             # no signature available: pass configured params verbatim
@@ -1033,7 +1060,12 @@ class Registry:
         problems: list[str] = []
         if not definition.introspect:
             return problems
-        spec = provider_spec(definition.provider)
+        try:
+            provider = definition.resolved_provider()
+        except DefinitionError as error:
+            # a lazy factory path that does not import is itself the problem
+            return [str(error)]
+        spec = provider_spec(provider)
         if not spec.introspectable:
             return problems
         known = {parameter.name for parameter in spec.parameters}
@@ -1137,7 +1169,12 @@ class Registry:
         def collect(current: Definition) -> None:
             if not current.introspect:
                 return
-            spec = provider_spec(current.provider)
+            try:
+                provider = current.resolved_provider()
+            except DefinitionError:
+                # unimportable lazy paths are reported by _validate_definition
+                return
+            spec = provider_spec(provider)
             if not spec.introspectable:
                 for value in current.params.values():
                     from_value(value)
