@@ -161,6 +161,45 @@ report = fresh.build(Report, title="weekly")
 Use it for request handlers, jobs, or other short-lived objects that
 want their dependencies wired up without becoming services themselves.
 
+## Profiles: dev/prod variants
+
+A registration can be limited to *profiles*. A registry is created with
+a set of active profiles; a definition registered with `profiles=` is
+only visible when the two sets intersect — otherwise it is invisible to
+every lookup, injection, `get_all()`, `warmup()`, and `validate()`:
+
+```python
+registry = Registry(profiles=["dev"])
+registry.register(SqliteDatabase, name="db", profiles=["dev"])
+registry.register(PostgresDatabase, name="db", profiles=["prod", "staging"])
+type(registry.get("db"))  # SqliteDatabase
+```
+
+A definition without profiles is *universal* — active everywhere. A
+bare string is accepted as a single profile name (`profiles="dev"` is
+`{"dev"}`, not the iterable of its characters).
+
+Two definitions may share a name (or an unnamed type) only when their
+profile sets are both non-empty and **disjoint** — then at most one of
+them can ever be active. Overlapping profile sets (or a universal
+definition on either side) collide as usual with
+{py:class}`~action0.service.errors.DuplicateServiceError` unless
+`replace=True`, which removes the overlapping definitions. If a registry
+is created with profiles that make several variants of one name active
+at once (`profiles=["dev", "prod"]` above), looking that name up raises
+{py:class}`~action0.service.errors.AmbiguousServiceError` naming the
+offending profiles.
+
+Profiles are **fixed at construction** and exposed as the read-only
+{py:attr}`~action0.service.registry.Registry.profiles` property.
+Flipping profiles on a live registry would leave cached singletons
+built for the old profile set behind — to switch, create a fresh
+registry (or a child; a child created without `profiles=` inherits its
+parent's, an explicit value overrides them). Activity is always judged
+by the registry layer that *owns* the definition: a parent's `prod`
+service stays visible to a `dev` child as long as it is active in the
+parent.
+
 ## Async factories
 
 A factory may be an `async def` function; it is registered exactly like

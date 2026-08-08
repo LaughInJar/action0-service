@@ -89,6 +89,9 @@ class Definition:
     eager: bool = False
     """Whether :py:meth:`~action0.service.registry.Registry.warmup` instantiates it."""
 
+    profiles: frozenset[str] = frozenset()
+    """Profiles under which this definition is active (empty = always active)."""
+
     managed: bool = True
     """Whether the registry created the instance and may dispose it on close."""
 

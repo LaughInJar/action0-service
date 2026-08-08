@@ -12,6 +12,8 @@ other key is a constructor parameter:
       provides: myapp.catalog.Catalog     # optional, defaults to the class
       default: true                       # optional: wins type lookups
       eager: false                        # optional: built by warmup()
+      profiles: [prod]                    # optional: active only under these
+                                          # profiles (string or list)
       api_key: !ENV ${CATALOG_KEY}        # everything else: init params
       db: !ref database                   # inject another service by name
       retry_policy:                       # nested mapping with "factory":
@@ -64,7 +66,9 @@ if TYPE_CHECKING:  # imported lazily by Registry.load_yaml, avoid the cycle
 
 # keys of a YAML definition that configure the registration itself;
 # everything else is a constructor parameter
-RESERVED_KEYS = frozenset({"factory", "scope", "provides", "default", "eager", "params"})
+RESERVED_KEYS = frozenset(
+    {"factory", "scope", "provides", "default", "eager", "profiles", "params"}
+)
 
 # inside anonymous nested factories only these are reserved
 _NESTED_RESERVED_KEYS = frozenset({"factory", "params"})
@@ -229,6 +233,7 @@ def _register_one(
             provides = provides_object
     default = bool(spec.pop("default", False))
     eager = bool(spec.pop("eager", False))
+    profiles = _pop_profiles(key, spec)
     params = _pop_params(key, spec, lazy=lazy)
     if lazy:
         # register the unimported dotted paths; Definition.materialize()
@@ -243,6 +248,7 @@ def _register_one(
             params=params,
             default=default,
             eager=eager,
+            profiles=frozenset(profiles or ()),
             factory_path=factory_path,
             provides_path=provides_path,
         )
@@ -258,6 +264,7 @@ def _register_one(
             provides=provides,
             default=default,
             eager=eager,
+            profiles=profiles,
             replace=replace,
         )
     except DuplicateServiceError:
@@ -265,6 +272,25 @@ def _register_one(
         raise
     except DefinitionError as error:
         raise DefinitionError(f"{key}: {error}") from error
+
+
+def _pop_profiles(key: str, spec: dict[Any, Any]) -> list[str] | None:
+    """
+    Extract and check the optional ``profiles`` key of a definition.
+
+    :param key: the service name, for error messages
+    :param spec: the definition mapping being consumed
+    :returns: the profile names, or ``None`` when the key is absent
+    :raises DefinitionError: if the value is not a string or list of strings
+    """
+    value = spec.pop("profiles", None)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    raise DefinitionError(f"{key}: 'profiles' must be a string or a list of strings")
 
 
 def _pop_params(key: str, spec: dict[Any, Any], *, lazy: bool) -> dict[str, Any]:
