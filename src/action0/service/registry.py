@@ -41,7 +41,11 @@ from typing import overload
 from action0.service.definitions import NON_INJECTABLE_TYPES
 from action0.service.definitions import AnonymousFactory
 from action0.service.definitions import Definition
+from action0.service.definitions import check_requested_type
 from action0.service.definitions import infer_provides
+from action0.service.definitions import is_protocol
+from action0.service.definitions import is_runtime_checkable
+from action0.service.definitions import matches_type
 from action0.service.definitions import provider_spec
 from action0.service.definitions import unwrap_annotation
 from action0.service.errors import AmbiguousServiceError
@@ -161,7 +165,9 @@ class Registry:
             :py:class:`~action0.service.markers.Ref` markers referencing
             other services
         :param provides: the type to register under; defaults to the class
-            itself or the factory's return annotation
+            itself or the factory's return annotation; may be a
+            runtime-checkable :py:class:`typing.Protocol` the provider
+            satisfies structurally
         :param default: whether this definition wins ambiguous type lookups;
             defaults to ``True`` for unnamed and ``False`` for named services
         :param eager: instantiate this service in :py:meth:`warmup`
@@ -183,7 +189,24 @@ class Registry:
                 "annotation to the factory or pass provides=..."
             )
         if provides is not None and isinstance(provider, type):
-            if not issubclass(provider, provides):
+            if is_protocol(provides):
+                if not is_runtime_checkable(provides):
+                    raise DefinitionError(
+                        f"provides={provides.__name__} is a protocol but not runtime-checkable "
+                        "— decorate it with @typing.runtime_checkable"
+                    )
+                try:
+                    satisfies = issubclass(provider, provides)
+                except TypeError:
+                    # non-method members cannot be verified on a class;
+                    # accept the registration unchecked
+                    satisfies = True
+                if not satisfies:
+                    raise DefinitionError(
+                        f"{provider.__name__} does not satisfy protocol "
+                        f"provides={provides.__name__}"
+                    )
+            elif not issubclass(provider, provides):
                 raise DefinitionError(
                     f"{provider.__name__} is not a subclass of provides={provides.__name__}"
                 )
@@ -217,7 +240,9 @@ class Registry:
         :param instance: the object to serve
         :param name: optional service name
         :param provides: the type to register under; defaults to
-            ``type(instance)``
+            ``type(instance)``; may be a runtime-checkable
+            :py:class:`typing.Protocol` the instance satisfies (verified
+            with ``isinstance``, non-method members included)
         :param default: whether this definition wins ambiguous type lookups;
             defaults to ``True`` for unnamed and ``False`` for named services
         :param replace: overwrite a colliding registration instead of raising
@@ -227,10 +252,18 @@ class Registry:
         :raises DuplicateServiceError: on collisions without ``replace``
         """
         self._check_open()
-        if provides is not None and not isinstance(instance, provides):
-            raise DefinitionError(
-                f"{instance!r} is not an instance of provides={provides.__name__}"
-            )
+        if provides is not None:
+            if is_protocol(provides) and not is_runtime_checkable(provides):
+                raise DefinitionError(
+                    f"provides={provides.__name__} is a protocol but not runtime-checkable "
+                    "— decorate it with @typing.runtime_checkable"
+                )
+            # for runtime-checkable protocols isinstance() verifies the
+            # instance structurally, non-method members included
+            if not isinstance(instance, provides):
+                raise DefinitionError(
+                    f"{instance!r} is not an instance of provides={provides.__name__}"
+                )
         definition = Definition(
             provider=lambda: instance,
             provides=provides if provides is not None else type(instance),
@@ -360,9 +393,12 @@ class Registry:
         Return the service instance for a type or name.
 
         Type lookups are subclass-aware: a service registered as
-        ``PostgresDb`` also answers ``get(Database)``. With several
-        candidates, the (single) one marked default wins; otherwise an exact
-        type match; otherwise :py:class:`~action0.service.errors.AmbiguousServiceError`
+        ``PostgresDb`` also answers ``get(Database)``. Requesting a
+        runtime-checkable :py:class:`typing.Protocol` matches *structurally*:
+        every registration whose provided type satisfies the protocol is a
+        candidate. With several candidates, the (single) one marked default
+        wins; otherwise an exact type match; otherwise
+        :py:class:`~action0.service.errors.AmbiguousServiceError`
         is raised. Lookups not satisfied locally fall back to the parent
         registry.
 
@@ -720,7 +756,7 @@ class Registry:
             if found is None:
                 raise ServiceNotFoundError(f"no service named {name!r}")
             definition, _ = found
-            if not issubclass(definition.provides, key):
+            if not matches_type(definition.provides, key):
                 raise ServiceNotFoundError(
                     f"service {name!r} provides {definition.provides.__name__}, not {key.__name__}"
                 )
@@ -759,14 +795,15 @@ class Registry:
         :raises AmbiguousServiceError: if a layer has several candidates and
             no clear winner
         """
+        check_requested_type(requested)
         # among active overrides the most recent match wins outright
         for definition in reversed(self._overrides):
-            if issubclass(definition.provides, requested):
+            if matches_type(definition.provides, requested):
                 return definition, self
         local_candidates = [
             definition
             for definition in self._definitions
-            if issubclass(definition.provides, requested)
+            if matches_type(definition.provides, requested)
         ]
         if local_candidates:
             return self._select(local_candidates, requested), self
@@ -811,13 +848,14 @@ class Registry:
         :param requested: the requested type
         :returns: ``(definition, owner)`` pairs in resolution order
         """
+        check_requested_type(requested)
         collected: list[tuple[Definition, Registry]] = (
             self._parent._collect_by_type(requested) if self._parent is not None else []
         )
         collected += [
             (definition, self)
             for definition in self._definitions
-            if issubclass(definition.provides, requested)
+            if matches_type(definition.provides, requested)
         ]
         if self._overrides:
             overridden_names = {
@@ -831,7 +869,7 @@ class Registry:
             collected += [
                 (definition, self)
                 for definition in self._overrides
-                if issubclass(definition.provides, requested)
+                if matches_type(definition.provides, requested)
             ]
         return collected
 

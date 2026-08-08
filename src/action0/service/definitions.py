@@ -22,6 +22,7 @@ from typing import Annotated
 from typing import Any
 from typing import Union
 
+from action0.service.errors import ServiceError
 from action0.service.markers import Named
 
 # Value-ish builtin types that are never resolved from the registry by bare
@@ -227,6 +228,84 @@ def infer_provides(provider: Callable[..., Any]) -> type[Any] | None:
     if isinstance(return_type, type) and return_type is not type(None):
         return return_type
     return None
+
+
+def is_protocol(tp: type[Any]) -> bool:
+    """
+    Return whether ``tp`` is a :py:class:`typing.Protocol` class.
+
+    :param tp: the type to test
+    :returns: ``True`` for protocol classes, ``False`` for nominal classes
+    """
+    # typing.is_protocol() only exists since 3.13; the underlying attribute
+    # is what it reads and is stable across the supported versions
+    return getattr(tp, "_is_protocol", False) is True
+
+
+def is_runtime_checkable(tp: type[Any]) -> bool:
+    """
+    Return whether protocol ``tp`` is decorated with :py:func:`typing.runtime_checkable`.
+
+    :param tp: the protocol class to test
+    :returns: whether ``isinstance``/``issubclass`` checks are allowed on it
+    """
+    return getattr(tp, "_is_runtime_protocol", False) is True
+
+
+def check_requested_type(requested: type[Any]) -> None:
+    """
+    Verify that ``requested`` is usable as a type-lookup key.
+
+    :param requested: the requested type
+    :raises ServiceError: if ``requested`` is a protocol that is not
+        decorated with :py:func:`typing.runtime_checkable` — structural
+        matching relies on ``issubclass``, which such protocols refuse
+    """
+    if is_protocol(requested) and not is_runtime_checkable(requested):
+        raise ServiceError(
+            f"cannot look up protocol {requested.__name__}: it is not runtime-checkable — "
+            "decorate it with @typing.runtime_checkable to use it in lookups and injection"
+        )
+
+
+def matches_type(provides: type[Any], requested: type[Any]) -> bool:
+    """
+    Return whether a definition providing ``provides`` satisfies ``requested``.
+
+    Nominal classes match by :py:func:`issubclass`. When ``requested`` is a
+    runtime-checkable :py:class:`typing.Protocol`, matching is *structural*:
+    any provided type whose members satisfy the protocol matches, no
+    inheritance required.
+
+    :param provides: the type a definition provides
+    :param requested: the requested type (a class or a runtime-checkable
+        protocol)
+    :returns: whether the definition satisfies the request
+    :raises ServiceError: if ``requested`` is a protocol that is not
+        runtime-checkable, or one with non-method members (which
+        ``issubclass`` cannot verify on a class)
+    """
+    if provides is requested:
+        return True
+    if is_protocol(requested):
+        check_requested_type(requested)
+        try:
+            return issubclass(provides, requested)
+        except TypeError as error:
+            # typing refuses issubclass for protocols with non-method
+            # members: attribute presence cannot be verified on a class.
+            # Exact-protocol registrations still work via the identity
+            # fast path above.
+            raise ServiceError(
+                f"cannot match protocol {requested.__name__} structurally: {error} — "
+                "register the service with provides=... and request it by name or by "
+                "that exact protocol"
+            ) from error
+    try:
+        return issubclass(provides, requested)
+    except TypeError:
+        # exotic non-class "types" simply do not match anything nominally
+        return False
 
 
 def unwrap_annotation(annotation: Any) -> tuple[Any, bool, str | None]:
