@@ -22,7 +22,7 @@ from action0.service.scopes import SingletonScope
 from action0.service.scopes import ThreadScope
 from action0.service.scopes import TransientScope
 
-__version__: str = "0.1.0"
+__version__: str = "0.1.1"
 
 __all__ = [
     "AmbiguousServiceError",
