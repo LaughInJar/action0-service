@@ -18,8 +18,11 @@ For each parameter, the first applicable rule wins:
 3. **The annotated type.** If the annotation is a class — after
    unwrapping `Annotated[...]` layers and `X | None` — the registry
    resolves it like `get(X)` would, including subclass-awareness,
-   default selection, and parent fallback. Value-ish builtins are
-   exempt, see [below](#what-is-never-injected).
+   default selection, and parent fallback. A runtime-checkable
+   {py:class}`typing.Protocol` annotation resolves structurally, see
+   [structural lookups](lookup.md#structural-lookups-protocols).
+   Value-ish builtins are exempt, see
+   [below](#what-is-never-injected).
 4. **The provider's own default.** If nothing was configured and no
    service matches, a declared default value stands.
 5. **`None` for optional annotations.** An `X | None` parameter
