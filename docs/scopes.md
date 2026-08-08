@@ -3,7 +3,7 @@
 A scope decides how long a built instance is kept and who shares it.
 Every registration has one; the default is `singleton`. Scopes are
 addressed through the {py:class}`~action0.service.scopes.Scope` enum or
-its string values — the strings are what YAML catalogs use.
+its string values — the strings are what YAML definitions use.
 
 ```python
 from action0.service import Registry, Scope

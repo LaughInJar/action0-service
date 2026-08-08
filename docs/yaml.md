@@ -1,4 +1,4 @@
-# YAML service catalogs
+# YAML service definitions
 
 Whole registries can be defined in YAML — wiring as configuration,
 without a rebuild. Loading requires PyYAML (install
@@ -23,13 +23,13 @@ definition, a handful of *reserved keys* configure the registration —
 every other key is a constructor parameter:
 
 ```yaml
-shop.catalog:
-  factory: myapp.catalog.ApiCatalog   # dotted path — required
+mailer.bulk:
+  factory: myapp.mail.SmtpMailer      # dotted path — required
   scope: singleton                    # optional (default: singleton)
-  provides: myapp.catalog.Catalog     # optional, defaults to the class
+  provides: myapp.mail.Mailer         # optional, defaults to the class
   default: true                       # optional: wins type lookups
   eager: false                        # optional: built by warmup()
-  api_key: !ENV ${CATALOG_KEY}        # everything else: init params
+  api_key: !ENV ${MAILER_KEY}         # everything else: init params
   db: !ref database                   # inject another service by name
   retry_policy:                       # nested mapping with "factory":
     factory: myapp.util.Retry         # built fresh as an anonymous object
@@ -120,23 +120,23 @@ are **templates**: parsed, so their anchors can be referenced — but not
 registered:
 
 ```yaml
-.defaults: &defaults
-  factory: myapp.catalog.ApiCatalog
+.mailer: &mailer
+  factory: myapp.mail.SmtpMailer
   timeout: 30
 
-catalog.eu:
-  <<: *defaults
-  api_key: !ENV ${EU_API_KEY}
+mailer.bulk:
+  <<: *mailer
+  api_key: !ENV ${BULK_MAIL_KEY}
 
-catalog.us:
-  <<: *defaults
-  api_key: !ENV ${US_API_KEY}
+mailer.newsletter:
+  <<: *mailer
+  api_key: !ENV ${NEWSLETTER_KEY}
 ```
 
 ## Lazy loading
 
 By default every `factory` and `provides` path is imported while the
-catalog loads. For a large catalog that can mean importing your whole
+file loads. For a large file that can mean importing your whole
 application at boot even though most services are never used in a given
 process. `lazy=True` defers the imports:
 

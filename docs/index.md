@@ -4,14 +4,14 @@ A lightweight service registry and dependency injection framework:
 register classes, factories, or ready-made instances — by type or by
 name — and request them back with their constructor dependencies
 resolved automatically. Scopes (singleton, transient, thread-local,
-context-local), YAML service catalogs, and a test-friendly override
+context-local), YAML service definitions, and a test-friendly override
 mechanism included. The core has zero dependencies.
 
 Requires Python 3.11 or newer.
 
 ```shell
 pip install action0-service          # or: uv add action0-service
-pip install "action0-service[yaml]"  # with YAML catalog support (PyYAML)
+pip install "action0-service[yaml]"  # with YAML support (PyYAML)
 ```
 
 ## A taste
@@ -57,7 +57,7 @@ create, fill, and pass around (or nest, see
   writing custom scopes.
 - [Parent registries and overrides](registries.md) — layered wiring for
   requests and tests.
-- [YAML service catalogs](yaml.md) — the full file format, `!ENV` and
+- [YAML service definitions](yaml.md) — the full file format, `!ENV` and
   `!ref` tags.
 - [Lifecycle](lifecycle.md) — `validate()`, `warmup()`, `close()`.
 - [API reference](api.md) — every public class and function.

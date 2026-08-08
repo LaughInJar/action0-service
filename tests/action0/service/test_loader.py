@@ -35,16 +35,16 @@ class Postgres(Database):
     pass
 
 
-class Catalog:
-    def __init__(self, name, db, predictors=None):
+class Mailer:
+    def __init__(self, name, db, filters=None):
         self.name = name
         self.db = db
-        self.predictors = predictors or []
+        self.filters = filters or []
 
 
-class Predictor:
-    def __init__(self, share=0.1):
-        self.share = share
+class Filter:
+    def __init__(self, threshold=0.1):
+        self.threshold = threshold
 
 
 class Reserved:
@@ -143,20 +143,20 @@ class LoadYamlTestCase(unittest.TestCase):
     def test_name_is_a_plain_init_param(self) -> None:
         """
         Unlike the reserved keys, ``name`` flows into the constructor
-        (catalogs whose factories take the service name rely on this).
+        (files that pass the service name on to the factory rely on this).
         """
         registry = Registry()
         self.load(
             registry,
             f"""
-            shop.catalog:
-              factory: {MODULE}.Catalog
-              name: shop
+            mailer.bulk:
+              factory: {MODULE}.Mailer
+              name: bulk
               db:
                 factory: {MODULE}.Database
             """,
         )
-        self.assertEqual(registry.get("shop.catalog").name, "shop")
+        self.assertEqual(registry.get("mailer.bulk").name, "bulk")
 
     def test_ref_tag(self) -> None:
         """
@@ -169,13 +169,13 @@ class LoadYamlTestCase(unittest.TestCase):
             database:
               factory: {MODULE}.Database
 
-            catalog:
-              factory: {MODULE}.Catalog
+            mailer:
+              factory: {MODULE}.Mailer
               name: main
               db: !ref database
             """,
         )
-        self.assertIs(registry.get("catalog").db, registry.get("database"))
+        self.assertIs(registry.get("mailer").db, registry.get("database"))
 
     def test_dangling_ref_raises_at_build(self) -> None:
         """
@@ -185,14 +185,14 @@ class LoadYamlTestCase(unittest.TestCase):
         self.load(
             registry,
             f"""
-            catalog:
-              factory: {MODULE}.Catalog
+            mailer:
+              factory: {MODULE}.Mailer
               name: main
               db: !ref missing
             """,
         )
         with self.assertRaises(ServiceNotFoundError):
-            registry.get("catalog")
+            registry.get("mailer")
 
     def test_env_tag(self) -> None:
         """
@@ -253,21 +253,21 @@ class LoadYamlTestCase(unittest.TestCase):
         self.load(
             registry,
             f"""
-            catalog:
-              factory: {MODULE}.Catalog
+            mailer:
+              factory: {MODULE}.Mailer
               name: main
               db:
                 factory: {MODULE}.Database
                 dsn: nested://
-              predictors:
-                - factory: {MODULE}.Predictor
-                  share: 0.5
-                - factory: {MODULE}.Predictor
+              filters:
+                - factory: {MODULE}.Filter
+                  threshold: 0.5
+                - factory: {MODULE}.Filter
             """,
         )
-        catalog = registry.get("catalog")
-        self.assertEqual(catalog.db.dsn, "nested://")
-        self.assertEqual([predictor.share for predictor in catalog.predictors], [0.5, 0.1])
+        mailer = registry.get("mailer")
+        self.assertEqual(mailer.db.dsn, "nested://")
+        self.assertEqual([f.threshold for f in mailer.filters], [0.5, 0.1])
 
     def test_anchors_merge_and_templates(self) -> None:
         """
@@ -279,7 +279,7 @@ class LoadYamlTestCase(unittest.TestCase):
             registry,
             f"""
             .base: &base
-              factory: {MODULE}.Catalog
+              factory: {MODULE}.Mailer
               db: !ref database
 
             database:
@@ -469,7 +469,7 @@ class LoadYamlTestCase(unittest.TestCase):
 
     def test_validate_after_load(self) -> None:
         """
-        A loaded catalog passes static validation.
+        A loaded file passes static validation.
         """
         registry = Registry()
         self.load(
@@ -478,8 +478,8 @@ class LoadYamlTestCase(unittest.TestCase):
             database:
               factory: {MODULE}.Database
 
-            catalog:
-              factory: {MODULE}.Catalog
+            mailer:
+              factory: {MODULE}.Mailer
               name: main
               db: !ref database
             """,
@@ -608,7 +608,7 @@ class LazyLoadTestCase(unittest.TestCase):
 
     def test_validate_materializes_good_paths(self) -> None:
         """
-        ``validate()`` on a healthy lazy catalog imports it and passes.
+        ``validate()`` on a healthy lazy file imports it and passes.
         """
         module = self.fresh_module()
         registry = Registry()
@@ -618,8 +618,8 @@ class LazyLoadTestCase(unittest.TestCase):
             database:
               factory: {module}.Database
 
-            catalog:
-              factory: {module}.Catalog
+            mailer:
+              factory: {module}.Mailer
               name: main
               db: !ref database
             """,
@@ -638,8 +638,8 @@ class LazyLoadTestCase(unittest.TestCase):
         self.load(
             registry,
             f"""
-            catalog:
-              factory: {module}.Catalog
+            mailer:
+              factory: {module}.Mailer
               name: main
               db:
                 factory: {module}.Database
@@ -647,8 +647,8 @@ class LazyLoadTestCase(unittest.TestCase):
             """,
         )
         self.assertNotIn(module, sys.modules)
-        catalog = registry.get("catalog")
-        self.assertEqual(catalog.db.dsn, "nested://")
+        mailer = registry.get("mailer")
+        self.assertEqual(mailer.db.dsn, "nested://")
 
     def test_replace_and_duplicates_without_import(self) -> None:
         """

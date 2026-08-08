@@ -6,15 +6,15 @@ other key is a constructor parameter:
 
 .. code-block:: yaml
 
-    shop.catalog:
-      factory: myapp.catalog.ApiCatalog   # dotted path — required
+    mailer.bulk:
+      factory: myapp.mail.SmtpMailer      # dotted path — required
       scope: singleton                    # optional (default: singleton)
-      provides: myapp.catalog.Catalog     # optional, defaults to the class
+      provides: myapp.mail.Mailer         # optional, defaults to the class
       default: true                       # optional: wins type lookups
       eager: false                        # optional: built by warmup()
       profiles: [prod]                    # optional: active only under these
                                           # profiles (string or list)
-      api_key: !ENV ${CATALOG_KEY}        # everything else: init params
+      api_key: !ENV ${MAILER_KEY}         # everything else: init params
       db: !ref database                   # inject another service by name
       retry_policy:                       # nested mapping with "factory":
         factory: myapp.util.Retry         # built fresh as an anonymous object

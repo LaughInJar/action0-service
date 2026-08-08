@@ -211,19 +211,19 @@ class LazyAsyncTestCase(unittest.IsolatedAsyncioTestCase):
         sys.modules.pop("a0svc_async_mod", None)
         cls._tmp.cleanup()
 
-    CATALOG = "session:\n  factory: a0svc_async_mod.make_session\n"
+    SERVICES = "session:\n  factory: a0svc_async_mod.make_session\n"
 
     async def test_aget_materializes_lazy_async_factory(self) -> None:
         """aget() imports the factory on first use and awaits it."""
         registry = Registry()
-        registry.load_yaml(io.StringIO(self.CATALOG), lazy=True)
+        registry.load_yaml(io.StringIO(self.SERVICES), lazy=True)
         instance = await registry.aget("session")
         self.assertEqual(type(instance).__name__, "Session")
 
     async def test_sync_get_of_lazy_async_factory_raises(self) -> None:
         """get() must refuse the factory even though is_async was unknown."""
         registry = Registry()
-        registry.load_yaml(io.StringIO(self.CATALOG), lazy=True)
+        registry.load_yaml(io.StringIO(self.SERVICES), lazy=True)
         with self.assertRaisesRegex(ServiceError, "aget"):
             registry.get("session")
 

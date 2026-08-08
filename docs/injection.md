@@ -9,7 +9,7 @@ the factory callable itself. The rules are few and strictly ordered.
 For each parameter, the first applicable rule wins:
 
 1. **Configured `params`.** A value given at registration (or in a
-   YAML catalog) is used as-is —
+   YAML file) is used as-is —
    {py:class}`~action0.service.markers.Ref` markers and nested
    containers are resolved first, see [below](#ref-values).
 2. **A `Named` qualifier.** If the annotation is
